@@ -366,14 +366,23 @@ module.exports = function registerGame(app, db, helpers) {
 
   // Public snapshot of a player for the client
   function publicState(p) {
-    const pc = playerCombat(p, "melee");
+    const pcM = playerCombat(p, "melee");
+    const pcR = playerCombat(p, "ranged");
+    const pcMag = playerCombat(p, "magic");
     const sk = normSkills(p.skills);
     const skills = {};
-    SKILL_KEYS.forEach((k) => { skills[k] = { xp: sk[k], level: pc.levels[k] }; });
+    SKILL_KEYS.forEach((k) => { skills[k] = { xp: sk[k], level: pcM.levels[k] }; });
     return {
       name: p.name, coins: p.coins,
       skills: skills,
-      combat: pc.combat, maxHit: pc.maxHit, maxHp: pc.maxHp,
+      combat: pcM.combat, maxHit: pcM.maxHit, maxHp: pcM.maxHp,
+      // authoritative per-style numbers so the client can render live hits/misses
+      combatStats: {
+        melee: { acc: pcM.accuracy, maxHit: pcM.maxHit },
+        ranged: { acc: pcR.accuracy, maxHit: pcR.maxHit },
+        magic: { acc: pcMag.accuracy, maxHit: pcMag.maxHit },
+        defence: pcM.defence,
+      },
       inventory: p.inventory, equipment: p.equipment,
       totalKills: p.totalKills, bossKills: p.bossKills,
     };
@@ -478,6 +487,49 @@ module.exports = function registerGame(app, db, helpers) {
     });
   });
 
+  // Real-time kill: the client whittles an enemy's HP locally (so it can show
+  // hit/miss/block and HP bars), then reports the kill here to be awarded.
+  // Rate-limited per enemy so it can't be spammed faster than a real fight.
+  app.post("/api/game/kill", (req, res) => {
+    const name = requireSession(req, res); if (!name) return;
+    let p = getPlayer(name); if (!p) p = createPlayer(name);
+    const target = typeof req.body.target === "string" ? req.body.target : "";
+    let style = typeof req.body.style === "string" ? req.body.style : "melee";
+    if (["melee", "ranged", "magic"].indexOf(style) === -1) style = "melee";
+    const isBoss = target === "boss";
+    const def = isBoss ? BOSS : ENEMIES[target];
+    if (!def) return res.status(400).json({ error: "No such enemy" });
+
+    const now = Date.now();
+    if (isBoss) {
+      const bs = bossState(now);
+      if (!bs.active) return res.status(400).json({ error: "The boss isn't here right now." });
+      if (p.lastBossSpawn === bs.spawnId) return res.status(400).json({ error: "Already defeated this spawn." });
+    } else {
+      // loose floor tied to the enemy's toughness; won't throttle a fast legit kill
+      const minGap = Math.max(250, Math.min(1000, Math.round(def.hp * 5)));
+      if (now - p.lastAction < minGap) return res.status(429).json({ error: "Too fast" });
+    }
+
+    const feedRows = [];
+    const xpRes = grantXp(p, def.xp, style);
+    const loot = rollLoot(def, p, feedRows, p.name, def.name);
+    p.totalKills += 1;
+    p.lastAction = now;
+    if (isBoss) { p.bossKills += 1; p.lastBossSpawn = bossState(now).spawnId; }
+    if (feedRows.length) pushFeed(feedRows);
+    savePlayer(name, p);
+
+    const st = publicState(p);
+    st.bars = barsFor(p);
+    res.json({
+      foeName: def.name, isBoss: isBoss, style: style,
+      xpGains: xpRes.gains, levelUps: xpRes.levelUps,
+      loot: loot, state: st,
+      globalDrops: feedRows.map((r) => ({ item: r.item, itemName: r.itemName, kind: r.kind })),
+    });
+  });
+
   // Equip an item you own.
   app.post("/api/game/equip", (req, res) => {
     const name = requireSession(req, res); if (!name) return;
@@ -566,6 +618,23 @@ module.exports = function registerGame(app, db, helpers) {
     p.coins += gained;
     savePlayer(name, p);
     res.json({ ok: true, gained, state: publicState(p) });
+  });
+
+  // Ground-coin pickup. The client scatters coins in the world and calls this
+  // when you walk over one; the server decides the (small) amount and rate-
+  // limits so it can't be spammed for infinite money.
+  const lastPickup = {};
+  app.post("/api/game/pickup", (req, res) => {
+    const name = requireSession(req, res); if (!name) return;
+    let p = getPlayer(name); if (!p) p = createPlayer(name);
+    const now = Date.now();
+    const key = name.toLowerCase();
+    if (now - (lastPickup[key] || 0) < 220) return res.status(429).json({ error: "Too fast" });
+    lastPickup[key] = now;
+    const amount = randInt(1, 6);
+    p.coins += amount;
+    savePlayer(name, p);
+    res.json({ amount: amount, coins: p.coins });
   });
 
   // Leaderboard (top by total level then kills).
