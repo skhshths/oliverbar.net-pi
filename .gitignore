@@ -4,3 +4,4 @@ chat.db-shm
 chat.db-wal
 .env
 uploads/
+backups/
