@@ -14,14 +14,20 @@
 
 const crypto = require("crypto");
 const path = require("path");
+const fs = require("fs");
 const express = require("express");
 const Database = require("better-sqlite3");
+const multer = require("multer");
 
 // ---------- config ----------
 const PORT = Number(process.env.PORT || 8081);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "chat.db");
 const EDIT_PASSWORD = process.env.EDIT_PASSWORD || "asdfasdfasdf"; // admin key; override in .env
 const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || "*";
+// Uploaded files land in their own folder on disk (not in the database).
+const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(__dirname, "uploads");
+const MAX_FILE_BYTES = Number(process.env.MAX_FILE_BYTES || 15 * 1024 * 1024); // 15 MB
+fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
 const MAX_CHAT_MESSAGES = 200;
 const MAX_DM_MESSAGES = 300;
@@ -99,7 +105,22 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS stats (
     field TEXT PRIMARY KEY, value INTEGER NOT NULL DEFAULT 0
   );
+  CREATE TABLE IF NOT EXISTS files (
+    id TEXT PRIMARY KEY, name TEXT, type TEXT, size INTEGER,
+    filename TEXT NOT NULL, uploader TEXT, created INTEGER NOT NULL
+  );
 `);
+
+// Add the attachment column to existing message tables if it isn't there yet
+// (so upgrading an already-populated DB doesn't need a wipe).
+function ensureColumn(table, column, decl) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+  }
+}
+ensureColumn("global_messages", "attachment_json", "TEXT");
+ensureColumn("dm_messages", "attachment_json", "TEXT");
 
 function bumpStat(field) {
   db.prepare(
@@ -167,6 +188,7 @@ function globalRowToMsg(r) {
   if (r.deleted) { m.text = null; m.deleted = true; } else { m.text = r.text; }
   if (r.edited) m.edited = true;
   if (r.reply_json) m.replyTo = JSON.parse(r.reply_json);
+  if (!r.deleted && r.attachment_json) m.attachment = JSON.parse(r.attachment_json);
   return m;
 }
 function dmRowToMsg(r) {
@@ -174,7 +196,19 @@ function dmRowToMsg(r) {
   if (r.deleted) { m.text = null; m.deleted = true; } else { m.text = r.text; }
   if (r.edited) m.edited = true;
   if (r.reply_json) m.replyTo = JSON.parse(r.reply_json);
+  if (!r.deleted && r.attachment_json) m.attachment = JSON.parse(r.attachment_json);
   return m;
+}
+
+// Pulls a validated attachment descriptor from a send request body, or null.
+// The client uploads first (/api/upload), then sends the returned fileId.
+function resolveAttachment(body) {
+  const fileId = body && typeof body.attachment === "object" && body.attachment
+    ? body.attachment.fileId : (typeof body.fileId === "string" ? body.fileId : "");
+  if (!fileId || typeof fileId !== "string") return null;
+  const row = db.prepare("SELECT id, name, type, size FROM files WHERE id = ?").get(fileId);
+  if (!row) return null;
+  return { fileId: row.id, name: row.name, type: row.type, size: row.size };
 }
 function upsertThread(ownerName, conversation, message) {
   db.prepare(
@@ -214,6 +248,54 @@ function requireAdmin(req, res) {
 }
 
 app.get("/health", (req, res) => res.json({ ok: true }));
+
+// ---------- file uploads (stored on disk in UPLOADS_DIR, not the DB) ----------
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+    filename: (req, file, cb) => {
+      const ext = (path.extname(file.originalname || "") || "").slice(0, 16).replace(/[^.\w]/g, "");
+      cb(null, randomHex(16) + ext);
+    },
+  }),
+  limits: { fileSize: MAX_FILE_BYTES, files: 1 },
+});
+
+app.post("/api/upload", (req, res) => {
+  const name = requireSession(req, res); if (!name) return;
+  upload.single("file")(req, res, (err) => {
+    if (err) {
+      const msg = err.code === "LIMIT_FILE_SIZE"
+        ? `File too large (max ${Math.round(MAX_FILE_BYTES / 1024 / 1024)} MB)`
+        : "Upload failed";
+      return res.status(400).json({ error: msg });
+    }
+    if (!req.file) return res.status(400).json({ error: "No file" });
+    const id = randomHex(12);
+    const original = (req.file.originalname || "file").slice(0, 200);
+    const type = (req.file.mimetype || "application/octet-stream").slice(0, 100);
+    db.prepare(
+      "INSERT INTO files (id, name, type, size, filename, uploader, created) VALUES (?,?,?,?,?,?,?)"
+    ).run(id, original, type, req.file.size, req.file.filename, name, Date.now());
+    res.json({ fileId: id, name: original, type, size: req.file.size });
+  });
+});
+
+// Capability-URL download: the id is unguessable, so the URL itself is the
+// access token — which is what lets an <img src> load it without a session
+// header. Images/video/pdf render inline; everything else downloads.
+app.get("/api/file/:id", (req, res) => {
+  const row = db.prepare("SELECT * FROM files WHERE id = ?").get(req.params.id);
+  if (!row) return res.status(404).json({ error: "Not found" });
+  const full = path.join(UPLOADS_DIR, row.filename);
+  if (!fs.existsSync(full)) return res.status(404).json({ error: "Not found" });
+  const inlineOk = /^(image|video|audio)\//.test(row.type) || row.type === "application/pdf";
+  res.set("Content-Type", row.type || "application/octet-stream");
+  res.set("Content-Disposition",
+    (inlineOk ? "inline" : "attachment") + '; filename="' + row.name.replace(/[^\w.\- ]/g, "_") + '"');
+  res.set("Cache-Control", "public, max-age=31536000, immutable");
+  fs.createReadStream(full).pipe(res);
+});
 
 // ---------- auth / accounts ----------
 app.post("/api/chat/login", (req, res) => {
@@ -326,7 +408,8 @@ app.get("/api/chat", (req, res) => {
 app.post("/api/chat", (req, res) => {
   const name = requireSession(req, res); if (!name) return;
   const text = typeof req.body.text === "string" ? req.body.text.trim().slice(0, MAX_MESSAGE_LENGTH) : "";
-  if (!text) return res.status(400).json({ error: "text is required" });
+  const attachment = resolveAttachment(req.body);
+  if (!text && !attachment) return res.status(400).json({ error: "text is required" });
   const replyToId = typeof req.body.replyTo === "string" ? req.body.replyTo : "";
   let replyJson = null;
   if (replyToId) {
@@ -335,8 +418,8 @@ app.post("/api/chat", (req, res) => {
   }
   const id = randomHex(6);
   db.prepare(
-    "INSERT INTO global_messages (id, name, text, ts, reply_json, reactions_json) VALUES (?,?,?,?,?,'{}')"
-  ).run(id, name, text, Date.now(), replyJson);
+    "INSERT INTO global_messages (id, name, text, ts, reply_json, reactions_json, attachment_json) VALUES (?,?,?,?,?,'{}',?)"
+  ).run(id, name, text, Date.now(), replyJson, attachment ? JSON.stringify(attachment) : null);
   bumpStat("totalGlobalMessages");
   res.json({ ok: true, name, id });
 });
@@ -438,7 +521,8 @@ app.post("/api/dm/send", (req, res) => {
   const fromName = requireSession(req, res); if (!fromName) return;
   const convId = typeof req.body.convId === "string" ? req.body.convId : "";
   const text = typeof req.body.text === "string" ? req.body.text.trim().slice(0, MAX_MESSAGE_LENGTH) : "";
-  if (!convId || !text) return res.status(400).json({ error: "convId and text are required" });
+  const attachment = resolveAttachment(req.body);
+  if (!convId || (!text && !attachment)) return res.status(400).json({ error: "convId and text are required" });
   const conversation = getConversation(convId);
   if (!conversation) return res.status(404).json({ error: "Conversation not found" });
   if (!isParticipant(conversation, fromName)) return res.status(403).json({ error: "Not a participant in this conversation" });
@@ -457,10 +541,10 @@ app.post("/api/dm/send", (req, res) => {
   const id = randomHex(6);
   const ts = Date.now();
   db.prepare(
-    "INSERT INTO dm_messages (id, conv_id, from_name, text, ts, reply_json, reactions_json) VALUES (?,?,?,?,?,?,'{}')"
-  ).run(id, convId, fromName, text, ts, replyJson);
+    "INSERT INTO dm_messages (id, conv_id, from_name, text, ts, reply_json, reactions_json, attachment_json) VALUES (?,?,?,?,?,?,'{}',?)"
+  ).run(id, convId, fromName, text, ts, replyJson, attachment ? JSON.stringify(attachment) : null);
   bumpStat("totalDmMessages");
-  const message = { from: fromName, text, ts };
+  const message = { from: fromName, text: text || (attachment ? "📎 " + attachment.name : ""), ts };
   conversation.participants.forEach((p) => upsertThread(p, conversation, message));
   res.json({ ok: true, id });
 });
