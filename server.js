@@ -923,6 +923,9 @@ app.get("/api/admin/system", (req, res) => {
   res.json(out);
 });
 
+// ---------- RPG game (oliverbar.net/game) ----------
+require("./game")(app, db, { requireSession, randomHex });
+
 app.use((err, req, res, next) => {
   console.error(err);
   res.status(500).json({ error: "Server error: " + (err && err.message ? err.message : String(err)) });
