@@ -15,6 +15,7 @@
 const crypto = require("crypto");
 const path = require("path");
 const fs = require("fs");
+const { execSync } = require("child_process");
 const express = require("express");
 const Database = require("better-sqlite3");
 const multer = require("multer");
@@ -28,6 +29,11 @@ const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || "*";
 const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(__dirname, "uploads");
 const MAX_FILE_BYTES = Number(process.env.MAX_FILE_BYTES || 15 * 1024 * 1024); // 15 MB
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+// Personal-area files live in their own private folder, separate from chat
+// attachments, and are only ever served with the admin key.
+const MY_UPLOADS_DIR = process.env.MY_UPLOADS_DIR || path.join(__dirname, "myfiles");
+const MAX_MYFILE_BYTES = Number(process.env.MAX_MYFILE_BYTES || 100 * 1024 * 1024); // 100 MB
+fs.mkdirSync(MY_UPLOADS_DIR, { recursive: true });
 
 const MAX_CHAT_MESSAGES = 200;
 const MAX_DM_MESSAGES = 300;
@@ -108,6 +114,18 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS files (
     id TEXT PRIMARY KEY, name TEXT, type TEXT, size INTEGER,
     filename TEXT NOT NULL, uploader TEXT, created INTEGER NOT NULL
+  );
+  -- ---- personal area (admin-only): notes, cross-device clipboard, private files ----
+  CREATE TABLE IF NOT EXISTS notes (
+    id TEXT PRIMARY KEY, title TEXT DEFAULT '', body TEXT DEFAULT '',
+    created INTEGER NOT NULL, updated INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS clips (
+    id TEXT PRIMARY KEY, text TEXT NOT NULL, created INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS myfiles (
+    id TEXT PRIMARY KEY, name TEXT, type TEXT, size INTEGER,
+    filename TEXT NOT NULL, created INTEGER NOT NULL
   );
 `);
 
@@ -706,6 +724,203 @@ app.get("/api/admin/chat-stats", (req, res) => {
     totalDmMessages: getStat("totalDmMessages"),
     totalAccounts: db.prepare("SELECT COUNT(*) AS c FROM accounts").get().c,
   });
+});
+
+// ======================================================================
+//  PERSONAL AREA (personal.oliverbar.net) — admin-key only, private to me
+// ======================================================================
+
+// ---------- notes ----------
+app.get("/api/notes", (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const rows = db.prepare("SELECT id, title, body, created, updated FROM notes ORDER BY updated DESC").all();
+  res.json(rows);
+});
+app.post("/api/notes", (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const id = typeof req.body.id === "string" && req.body.id ? req.body.id : "";
+  const title = typeof req.body.title === "string" ? req.body.title.slice(0, 200) : "";
+  const body = typeof req.body.body === "string" ? req.body.body.slice(0, 100000) : "";
+  const now = Date.now();
+  if (id) {
+    const info = db.prepare("UPDATE notes SET title = ?, body = ?, updated = ? WHERE id = ?").run(title, body, now, id);
+    if (info.changes) return res.json({ id, title, body, updated: now });
+  }
+  const newId = randomHex(8);
+  db.prepare("INSERT INTO notes (id, title, body, created, updated) VALUES (?,?,?,?,?)").run(newId, title, body, now, now);
+  res.json({ id: newId, title, body, created: now, updated: now });
+});
+app.post("/api/notes/delete", (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const id = typeof req.body.id === "string" ? req.body.id : "";
+  db.prepare("DELETE FROM notes WHERE id = ?").run(id);
+  res.json({ ok: true });
+});
+
+// ---------- cross-device clipboard ----------
+const MAX_CLIPS = 50;
+app.get("/api/clipboard", (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  res.json(db.prepare("SELECT id, text, created FROM clips ORDER BY created DESC LIMIT ?").all(MAX_CLIPS));
+});
+app.post("/api/clipboard", (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const text = typeof req.body.text === "string" ? req.body.text.slice(0, 50000) : "";
+  if (!text.trim()) return res.status(400).json({ error: "text is required" });
+  const id = randomHex(8);
+  const created = Date.now();
+  db.prepare("INSERT INTO clips (id, text, created) VALUES (?,?,?)").run(id, text, created);
+  // Trim to the most recent MAX_CLIPS so this never grows unbounded.
+  db.prepare("DELETE FROM clips WHERE id NOT IN (SELECT id FROM clips ORDER BY created DESC LIMIT ?)").run(MAX_CLIPS);
+  res.json({ id, text, created });
+});
+app.post("/api/clipboard/delete", (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const id = typeof req.body.id === "string" ? req.body.id : "";
+  if (id === "*") db.exec("DELETE FROM clips;");
+  else db.prepare("DELETE FROM clips WHERE id = ?").run(id);
+  res.json({ ok: true });
+});
+
+// ---------- personal files (private; served ONLY with the admin key) ----------
+const myUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, MY_UPLOADS_DIR),
+    filename: (req, file, cb) => {
+      const ext = (path.extname(file.originalname || "") || "").slice(0, 16).replace(/[^.\w]/g, "");
+      cb(null, randomHex(16) + ext);
+    },
+  }),
+  limits: { fileSize: MAX_MYFILE_BYTES, files: 1 },
+});
+app.get("/api/myfiles", (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  res.json(db.prepare("SELECT id, name, type, size, created FROM myfiles ORDER BY created DESC").all());
+});
+app.post("/api/myfiles/upload", (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  myUpload.single("file")(req, res, (err) => {
+    if (err) {
+      const msg = err.code === "LIMIT_FILE_SIZE"
+        ? `File too large (max ${Math.round(MAX_MYFILE_BYTES / 1024 / 1024)} MB)`
+        : "Upload failed";
+      return res.status(400).json({ error: msg });
+    }
+    if (!req.file) return res.status(400).json({ error: "No file" });
+    const id = randomHex(12);
+    const original = (req.file.originalname || "file").slice(0, 200);
+    const type = (req.file.mimetype || "application/octet-stream").slice(0, 100);
+    db.prepare("INSERT INTO myfiles (id, name, type, size, filename, created) VALUES (?,?,?,?,?,?)")
+      .run(id, original, type, req.file.size, req.file.filename, Date.now());
+    res.json({ id, name: original, type, size: req.file.size });
+  });
+});
+// Unlike chat attachments, personal files are NOT capability URLs — they
+// require the admin key, so the frontend fetches them and makes a blob URL.
+app.get("/api/myfiles/:id", (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const row = db.prepare("SELECT * FROM myfiles WHERE id = ?").get(req.params.id);
+  if (!row) return res.status(404).json({ error: "Not found" });
+  const full = path.join(MY_UPLOADS_DIR, row.filename);
+  if (!fs.existsSync(full)) return res.status(404).json({ error: "Not found" });
+  const inlineOk = /^(image|video|audio)\//.test(row.type) || row.type === "application/pdf";
+  res.set("Content-Type", row.type || "application/octet-stream");
+  res.set("Content-Disposition",
+    (inlineOk ? "inline" : "attachment") + '; filename="' + row.name.replace(/[^\w.\- ]/g, "_") + '"');
+  fs.createReadStream(full).pipe(res);
+});
+app.post("/api/myfiles/delete", (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const id = typeof req.body.id === "string" ? req.body.id : "";
+  const row = db.prepare("SELECT filename FROM myfiles WHERE id = ?").get(id);
+  if (row) {
+    try { fs.unlinkSync(path.join(MY_UPLOADS_DIR, row.filename)); } catch (e) {}
+    db.prepare("DELETE FROM myfiles WHERE id = ?").run(id);
+  }
+  res.json({ ok: true });
+});
+
+// ---------- Pi system dashboard ----------
+// Reads live vitals off the host. Each probe is best-effort: on a non-Pi box
+// (or if a command is missing) the field comes back null instead of erroring.
+function sh(cmd) {
+  try { return execSync(cmd, { timeout: 2000 }).toString().trim(); } catch (e) { return null; }
+}
+app.get("/api/admin/system", (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const out = { ts: Date.now() };
+
+  // CPU temperature (°C)
+  const tempRaw = sh("vcgencmd measure_temp") || "";
+  let temp = null;
+  const tm = tempRaw.match(/([\d.]+)/);
+  if (tm) temp = Number(tm[1]);
+  if (temp === null) {
+    try { temp = Number(fs.readFileSync("/sys/class/thermal/thermal_zone0/temp", "utf8")) / 1000; } catch (e) {}
+  }
+  out.tempC = temp;
+
+  // Throttle / undervoltage flags (the charger problem shows up here)
+  const thr = sh("vcgencmd get_throttled") || "";
+  const hm = thr.match(/0x([0-9a-fA-F]+)/);
+  if (hm) {
+    const bits = parseInt(hm[1], 16);
+    out.throttled = {
+      raw: "0x" + bits.toString(16),
+      undervoltageNow: !!(bits & 0x1),
+      throttledNow: !!(bits & 0x4),
+      undervoltageEver: !!(bits & 0x10000),
+      throttledEver: !!(bits & 0x40000),
+      ok: bits === 0,
+    };
+  } else {
+    out.throttled = null;
+  }
+
+  // Uptime + load
+  try {
+    const up = Number(fs.readFileSync("/proc/uptime", "utf8").split(" ")[0]);
+    out.uptimeSec = Math.round(up);
+  } catch (e) { out.uptimeSec = null; }
+  try {
+    const la = fs.readFileSync("/proc/loadavg", "utf8").split(" ");
+    out.load = { "1m": Number(la[0]), "5m": Number(la[1]), "15m": Number(la[2]) };
+  } catch (e) { out.load = null; }
+
+  // Memory (from /proc/meminfo, in kB)
+  try {
+    const mi = fs.readFileSync("/proc/meminfo", "utf8");
+    const grab = (k) => { const m = mi.match(new RegExp(k + ":\\s+(\\d+)")); return m ? Number(m[1]) * 1024 : null; };
+    const total = grab("MemTotal"), avail = grab("MemAvailable");
+    out.mem = { total, available: avail, used: total && avail ? total - avail : null };
+  } catch (e) { out.mem = null; }
+
+  // Disk usage of the root filesystem
+  const dfOut = sh("df -kP /");
+  if (dfOut) {
+    const line = dfOut.trim().split("\n").pop().split(/\s+/);
+    if (line.length >= 4) {
+      out.disk = { total: Number(line[1]) * 1024, used: Number(line[2]) * 1024, available: Number(line[3]) * 1024 };
+    }
+  } else { out.disk = null; }
+
+  // Is the chat service healthy? (itself, so always true here, but handy)
+  out.service = { up: true };
+  // Sizes of our own data on disk
+  const dirSize = (dir) => {
+    try {
+      return fs.readdirSync(dir).reduce((sum, f) => {
+        try { return sum + fs.statSync(path.join(dir, f)).size; } catch (e) { return sum; }
+      }, 0);
+    } catch (e) { return null; }
+  };
+  out.storage = {
+    db: (() => { try { return fs.statSync(DB_PATH).size; } catch (e) { return null; } })(),
+    uploads: dirSize(UPLOADS_DIR),
+    myfiles: dirSize(MY_UPLOADS_DIR),
+  };
+
+  res.json(out);
 });
 
 app.use((err, req, res, next) => {
