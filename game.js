@@ -110,6 +110,20 @@ module.exports = function registerGame(app, db, helpers) {
     dye_violet:    { name: "Violet Dye", type: "dye", color: "#8e44ad", value: 800 },
     dye_onyx:      { name: "Onyx Dye", type: "dye", color: "#1a1a1f", value: 2500, glow: true },
     dye_prismatic: { name: "Prismatic Dye", type: "dye", color: "prismatic", value: 30000, glow: true },
+
+    // --- mithril armour (shop tier between steel and warden) ---
+    mithril_helm: { name: "Mithril Helm", type: "armor", slot: "helmet", def: 9, value: 260, buy: 1800, dyeable: true, base: "#5f6f8a" },
+    mithril_body: { name: "Mithril Platebody", type: "armor", slot: "body", def: 16, value: 520, buy: 3800, dyeable: true, base: "#5f6f8a" },
+    mithril_legs: { name: "Mithril Platelegs", type: "armor", slot: "legs", def: 12, value: 400, buy: 2700, dyeable: true, base: "#5f6f8a" },
+
+    // --- farming: seeds, crops (food), and baked goods ---
+    wheat_seeds:  { name: "Wheat Seeds", type: "seed", value: 4, buy: 15 },
+    wheat:        { name: "Wheat", type: "food", value: 8, heal: 6 },
+    wheat_fine:   { name: "Fine Wheat", type: "food", value: 22, heal: 15 },
+    wheat_golden: { name: "Golden Wheat", type: "food", value: 60, heal: 32, glow: true },
+    bread:        { name: "Bread", type: "food", value: 45, heal: 40 },
+    hearty_loaf:  { name: "Hearty Loaf", type: "food", value: 140, heal: 85, glow: true },
+    health_potion:{ name: "Health Potion", type: "food", value: 70, heal: 60, buy: 180 },
   };
 
   // ---------- content: enemies ----------
@@ -201,11 +215,12 @@ module.exports = function registerGame(app, db, helpers) {
   ensureCol("discovered_json", "TEXT DEFAULT '{}'");
   ensureCol("quest_json", "TEXT");
   ensureCol("quest_cooldown", "INTEGER DEFAULT 0");
+  ensureCol("crops_json", "TEXT DEFAULT '{}'");
 
   // ---------- helpers ----------
-  var SKILL_KEYS = ["attack", "strength", "defence", "hitpoints", "ranged", "magic"];
+  var SKILL_KEYS = ["attack", "strength", "defence", "hitpoints", "ranged", "magic", "farming"];
   function freshSkills() {
-    return { attack: 0, strength: 0, defence: 0, hitpoints: START_HP_XP, ranged: 0, magic: 0 };
+    return { attack: 0, strength: 0, defence: 0, hitpoints: START_HP_XP, ranged: 0, magic: 0, farming: 0 };
   }
   // tolerate older rows that predate ranged/magic
   function normSkills(s) {
@@ -227,6 +242,7 @@ module.exports = function registerGame(app, db, helpers) {
       discovered: JSON.parse(row.discovered_json || "{}"),
       quest: row.quest_json ? JSON.parse(row.quest_json) : null,
       questCooldown: row.quest_cooldown || 0,
+      crops: JSON.parse(row.crops_json || "{}"),
     };
   }
   function createPlayer(name) {
@@ -244,11 +260,11 @@ module.exports = function registerGame(app, db, helpers) {
     db.prepare(
       `UPDATE game_players SET coins=?, skills_json=?, inventory_json=?, equipment_json=?,
         total_kills=?, boss_kills=?, last_boss_spawn=?, last_action=?,
-        ng_plus=?, weapon_upgrades_json=?, discovered_json=?, quest_json=?, quest_cooldown=?, updated=? WHERE name_key=?`
+        ng_plus=?, weapon_upgrades_json=?, discovered_json=?, quest_json=?, quest_cooldown=?, crops_json=?, updated=? WHERE name_key=?`
     ).run(p.coins, JSON.stringify(p.skills), JSON.stringify(p.inventory), JSON.stringify(p.equipment),
       p.totalKills, p.bossKills, p.lastBossSpawn, p.lastAction,
       p.ngPlus || 0, JSON.stringify(p.weaponUpgrades || {}), JSON.stringify(p.discovered || {}),
-      p.quest ? JSON.stringify(p.quest) : null, p.questCooldown || 0,
+      p.quest ? JSON.stringify(p.quest) : null, p.questCooldown || 0, JSON.stringify(p.crops || {}),
       Date.now(), name.toLowerCase());
   }
   function totalXpOf(p) { const s = normSkills(p.skills); return SKILL_KEYS.reduce((t, k) => t + s[k], 0); }
@@ -442,6 +458,7 @@ module.exports = function registerGame(app, db, helpers) {
       inventory: p.inventory, equipment: p.equipment,
       weaponUpgrades: p.weaponUpgrades || {}, discovered: p.discovered || {},
       quest: questView(p), questCooldownMs: Math.max(0, (p.questCooldown || 0) - Date.now()),
+      crops: p.crops || {},
       totalKills: p.totalKills, bossKills: p.bossKills,
     };
   }
@@ -699,6 +716,81 @@ module.exports = function registerGame(app, db, helpers) {
     savePlayer(name, p);
     const st = publicState(p); st.bars = barsFor(p);
     res.json({ ok: true, ngPlus: p.ngPlus, state: st });
+  });
+
+  // ---------- farming ----------
+  const GROW_MS = 35 * 1000;
+  function wheatTier(farmLevel) {
+    if (farmLevel >= 40) return "wheat_golden";
+    if (farmLevel >= 15) return "wheat_fine";
+    return "wheat";
+  }
+  function addSkillXp(p, skill, amount) {
+    p.skills = normSkills(p.skills);
+    amount = Math.round(amount * (1 + 0.10 * (p.ngPlus || 0)));
+    const before = levelFromXp(p.skills[skill]);
+    p.skills[skill] += amount;
+    const after = levelFromXp(p.skills[skill]);
+    return after > before ? { skill: skill, level: after } : null;
+  }
+  app.post("/api/game/farm/plant", (req, res) => {
+    const name = requireSession(req, res); if (!name) return;
+    const p = getPlayer(name); if (!p) return res.status(400).json({ error: "No player" });
+    const plot = typeof req.body.plot === "string" ? req.body.plot.slice(0, 40) : "";
+    if (!plot) return res.status(400).json({ error: "No plot" });
+    if (p.crops[plot]) return res.status(400).json({ error: "Already planted here" });
+    if ((p.inventory.wheat_seeds || 0) < 1) return res.status(400).json({ error: "You need wheat seeds" });
+    removeItem(p.inventory, "wheat_seeds", 1);
+    p.crops[plot] = Date.now();
+    savePlayer(name, p);
+    res.json({ ok: true, plot: plot, plantedAt: p.crops[plot], growMs: GROW_MS, state: publicState(p) });
+  });
+  app.post("/api/game/farm/harvest", (req, res) => {
+    const name = requireSession(req, res); if (!name) return;
+    const p = getPlayer(name); if (!p) return res.status(400).json({ error: "No player" });
+    const plot = typeof req.body.plot === "string" ? req.body.plot : "";
+    const planted = p.crops[plot];
+    if (!planted) return res.status(400).json({ error: "Nothing planted here" });
+    if (Date.now() - planted < GROW_MS) return res.status(400).json({ error: "Still growing" });
+    const farmLevel = levelFromXp(normSkills(p.skills).farming);
+    const tier = wheatTier(farmLevel);
+    const qty = 1 + (Math.random() < 0.4 ? 1 : 0);
+    addItem(p.inventory, tier, qty);
+    const lu = addSkillXp(p, "farming", 18 + Math.round(farmLevel * 0.6));
+    delete p.crops[plot];
+    savePlayer(name, p);
+    const st = publicState(p); st.bars = barsFor(p);
+    res.json({ ok: true, item: tier, itemName: ITEMS[tier].name, qty: qty, levelUp: lu, state: st });
+  });
+  // Eat a food item to heal (the client applies the heal to its live HP bar).
+  app.post("/api/game/eat", (req, res) => {
+    const name = requireSession(req, res); if (!name) return;
+    const p = getPlayer(name); if (!p) return res.status(400).json({ error: "No player" });
+    const item = typeof req.body.item === "string" ? req.body.item : "";
+    const it = ITEMS[item];
+    if (!it || it.type !== "food" || !it.heal) return res.status(400).json({ error: "Can't eat that" });
+    if ((p.inventory[item] || 0) < 1) return res.status(400).json({ error: "You don't have that" });
+    removeItem(p.inventory, item, 1);
+    savePlayer(name, p);
+    res.json({ ok: true, heal: it.heal, state: publicState(p) });
+  });
+  // Bakery: trade food into more refined food.
+  const BAKERY = [
+    { in: { wheat: 3 }, out: "bread", qty: 1 },
+    { in: { wheat_fine: 3 }, out: "hearty_loaf", qty: 1 },
+    { in: { wheat_golden: 2 }, out: "hearty_loaf", qty: 2 },
+  ];
+  app.post("/api/game/bake", (req, res) => {
+    const name = requireSession(req, res); if (!name) return;
+    const p = getPlayer(name); if (!p) return res.status(400).json({ error: "No player" });
+    const idx = Number(req.body.recipe);
+    const r = BAKERY[idx];
+    if (!r) return res.status(400).json({ error: "No such recipe" });
+    for (const k in r.in) { if ((p.inventory[k] || 0) < r.in[k]) return res.status(400).json({ error: "Not enough " + ITEMS[k].name }); }
+    for (const k in r.in) removeItem(p.inventory, k, r.in[k]);
+    addItem(p.inventory, r.out, r.qty);
+    savePlayer(name, p);
+    res.json({ ok: true, out: r.out, outName: ITEMS[r.out].name, qty: r.qty, state: publicState(p) });
   });
 
   // Equip an item you own.
