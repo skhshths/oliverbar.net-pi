@@ -33,22 +33,38 @@ module.exports = function registerGame(app, db, helpers) {
   }
   const START_HP_XP = LEVEL_XP[10]; // Hitpoints starts at level 10, like OSRS
 
+  // ---------- Player Level (PL): one "definite" level from total xp, caps at 99 ----------
+  // Threshold for PL n is roughly 5x a single-skill level, so PL tracks overall
+  // progress across the six skills and tops out around a strong (not maxed) build.
+  function plFromXp(totalXp) {
+    let pl = 1;
+    for (let i = 2; i <= MAX_LEVEL; i++) { if (totalXp >= LEVEL_XP[i] * 5) pl = i; else break; }
+    return pl;
+  }
+  function plBarFor(totalXp) {
+    const pl = plFromXp(totalXp);
+    const cur = (LEVEL_XP[pl] || 0) * 5;
+    const next = pl >= MAX_LEVEL ? cur : LEVEL_XP[pl + 1] * 5;
+    return { level: pl, xp: totalXp, curBase: cur, nextAt: next, max: pl >= MAX_LEVEL };
+  }
+
   // ---------- content: items ----------
   // type: weapon | armor | material | unique | dye
   // armor/weapon carry combat bonuses; materials/uniques sell for coins;
   // dyes recolor a dyeable armour piece and are consumed on use.
   const ITEMS = {
-    // --- weapons (buyable, plus one boss weapon) ---
-    bronze_sword: { name: "Bronze Sword", type: "weapon", slot: "weapon", atk: 1, str: 2, value: 15, buy: 60 },
-    iron_sword:   { name: "Iron Sword",   type: "weapon", slot: "weapon", atk: 3, str: 4, value: 45, buy: 220 },
-    steel_sword:  { name: "Steel Sword",  type: "weapon", slot: "weapon", atk: 6, str: 7, value: 140, buy: 900 },
-    mithril_sword:{ name: "Mithril Sword",type: "weapon", slot: "weapon", atk: 10, str: 11, value: 400, buy: 3200 },
-    warden_blade: { name: "Warden's Blade", type: "weapon", slot: "weapon", atk: 16, str: 16, value: 2500, glow: true },
+    // --- weapons (buyable, plus one boss weapon). `up` = the material the anvil
+    //     needs to upgrade it; upgrades add +n and boost the weapon's stat. ---
+    bronze_sword: { name: "Bronze Sword", type: "weapon", slot: "weapon", atk: 1, str: 2, value: 15, buy: 60, up: "rat_hide" },
+    iron_sword:   { name: "Iron Sword",   type: "weapon", slot: "weapon", atk: 3, str: 4, value: 45, buy: 220, up: "goblin_ear" },
+    steel_sword:  { name: "Steel Sword",  type: "weapon", slot: "weapon", atk: 6, str: 7, value: 140, buy: 900, up: "bone" },
+    mithril_sword:{ name: "Mithril Sword",type: "weapon", slot: "weapon", atk: 10, str: 11, value: 400, buy: 3200, up: "wolf_pelt" },
+    warden_blade: { name: "Warden's Blade", type: "weapon", slot: "weapon", atk: 16, str: 16, value: 2500, glow: true, up: "molten_shard" },
     // ranged + magic weapons so those styles have gear of their own
-    oak_shortbow: { name: "Oak Shortbow", type: "weapon", slot: "weapon", rng: 4, value: 40, buy: 200 },
-    yew_longbow:  { name: "Yew Longbow", type: "weapon", slot: "weapon", rng: 10, value: 300, buy: 2400 },
-    apprentice_staff: { name: "Apprentice Staff", type: "weapon", slot: "weapon", mag: 4, value: 40, buy: 200 },
-    sorcerer_staff:   { name: "Sorcerer Staff", type: "weapon", slot: "weapon", mag: 10, value: 300, buy: 2400 },
+    oak_shortbow: { name: "Oak Shortbow", type: "weapon", slot: "weapon", rng: 4, value: 40, buy: 200, up: "rat_hide" },
+    yew_longbow:  { name: "Yew Longbow", type: "weapon", slot: "weapon", rng: 10, value: 300, buy: 2400, up: "wolf_pelt" },
+    apprentice_staff: { name: "Apprentice Staff", type: "weapon", slot: "weapon", mag: 4, value: 40, buy: 200, up: "goblin_ear" },
+    sorcerer_staff:   { name: "Sorcerer Staff", type: "weapon", slot: "weapon", mag: 10, value: 300, buy: 2400, up: "golem_core" },
 
     // --- armour sets (dyeable). base is the undyed metal colour ---
     bronze_helm: { name: "Bronze Helm", type: "armor", slot: "helmet", def: 2, value: 20, buy: 80, dyeable: true, base: "#8a6a3f" },
@@ -165,6 +181,9 @@ module.exports = function registerGame(app, db, helpers) {
       skills_json TEXT NOT NULL, inventory_json TEXT NOT NULL, equipment_json TEXT NOT NULL,
       total_kills INTEGER DEFAULT 0, boss_kills INTEGER DEFAULT 0,
       last_boss_spawn INTEGER DEFAULT -1, last_action INTEGER DEFAULT 0,
+      ng_plus INTEGER DEFAULT 0,
+      weapon_upgrades_json TEXT DEFAULT '{}', discovered_json TEXT DEFAULT '{}',
+      quest_json TEXT, quest_cooldown INTEGER DEFAULT 0,
       created INTEGER NOT NULL, updated INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS game_feed (
@@ -172,6 +191,16 @@ module.exports = function registerGame(app, db, helpers) {
     );
     CREATE INDEX IF NOT EXISTS idx_game_feed_ts ON game_feed (ts);
   `);
+  // add newer columns to a pre-existing table
+  function ensureCol(col, decl) {
+    const cols = db.prepare("PRAGMA table_info(game_players)").all();
+    if (!cols.some((c) => c.name === col)) db.exec("ALTER TABLE game_players ADD COLUMN " + col + " " + decl);
+  }
+  ensureCol("ng_plus", "INTEGER DEFAULT 0");
+  ensureCol("weapon_upgrades_json", "TEXT DEFAULT '{}'");
+  ensureCol("discovered_json", "TEXT DEFAULT '{}'");
+  ensureCol("quest_json", "TEXT");
+  ensureCol("quest_cooldown", "INTEGER DEFAULT 0");
 
   // ---------- helpers ----------
   var SKILL_KEYS = ["attack", "strength", "defence", "hitpoints", "ranged", "magic"];
@@ -193,6 +222,11 @@ module.exports = function registerGame(app, db, helpers) {
       equipment: JSON.parse(row.equipment_json),
       totalKills: row.total_kills, bossKills: row.boss_kills,
       lastBossSpawn: row.last_boss_spawn, lastAction: row.last_action,
+      ngPlus: row.ng_plus || 0,
+      weaponUpgrades: JSON.parse(row.weapon_upgrades_json || "{}"),
+      discovered: JSON.parse(row.discovered_json || "{}"),
+      quest: row.quest_json ? JSON.parse(row.quest_json) : null,
+      questCooldown: row.quest_cooldown || 0,
     };
   }
   function createPlayer(name) {
@@ -209,10 +243,15 @@ module.exports = function registerGame(app, db, helpers) {
   function savePlayer(name, p) {
     db.prepare(
       `UPDATE game_players SET coins=?, skills_json=?, inventory_json=?, equipment_json=?,
-        total_kills=?, boss_kills=?, last_boss_spawn=?, last_action=?, updated=? WHERE name_key=?`
+        total_kills=?, boss_kills=?, last_boss_spawn=?, last_action=?,
+        ng_plus=?, weapon_upgrades_json=?, discovered_json=?, quest_json=?, quest_cooldown=?, updated=? WHERE name_key=?`
     ).run(p.coins, JSON.stringify(p.skills), JSON.stringify(p.inventory), JSON.stringify(p.equipment),
-      p.totalKills, p.bossKills, p.lastBossSpawn, p.lastAction, Date.now(), name.toLowerCase());
+      p.totalKills, p.bossKills, p.lastBossSpawn, p.lastAction,
+      p.ngPlus || 0, JSON.stringify(p.weaponUpgrades || {}), JSON.stringify(p.discovered || {}),
+      p.quest ? JSON.stringify(p.quest) : null, p.questCooldown || 0,
+      Date.now(), name.toLowerCase());
   }
+  function totalXpOf(p) { const s = normSkills(p.skills); return SKILL_KEYS.reduce((t, k) => t + s[k], 0); }
   function addItem(inv, id, qty) { inv[id] = (inv[id] || 0) + (qty || 1); }
   function removeItem(inv, id, qty) {
     if (!inv[id]) return false;
@@ -235,7 +274,10 @@ module.exports = function registerGame(app, db, helpers) {
     const magic = 0.325 * Math.floor(lv.magic * 1.5);
     return Math.floor(base + Math.max(melee, ranged, magic));
   }
-  function equipBonuses(equipment) {
+  const MAX_UPGRADE = 10;
+  function weaponPlus(p, item) { return Math.min(MAX_UPGRADE, (p.weaponUpgrades && p.weaponUpgrades[item]) || 0); }
+  function equipBonuses(p) {
+    const equipment = p.equipment;
     let atk = 0, str = 0, def = 0, rng = 0, mag = 0;
     Object.keys(equipment).forEach((slot) => {
       const e = equipment[slot];
@@ -243,6 +285,15 @@ module.exports = function registerGame(app, db, helpers) {
       const it = ITEMS[e.item];
       if (!it) return;
       atk += it.atk || 0; str += it.str || 0; def += it.def || 0; rng += it.rng || 0; mag += it.mag || 0;
+      // weapon upgrade bonus: +2 to the weapon's stat per +level (melee also +1 atk)
+      if (slot === "weapon") {
+        const plus = weaponPlus(p, e.item);
+        if (plus) {
+          if (it.rng) rng += plus * 2;
+          else if (it.mag) mag += plus * 2;
+          else { str += plus * 2; atk += plus; }
+        }
+      }
     });
     return { atk, str, def, rng, mag };
   }
@@ -250,7 +301,8 @@ module.exports = function registerGame(app, db, helpers) {
   function playerCombat(p, style) {
     style = style || "melee";
     const lv = skillLevels(p.skills);
-    const bon = equipBonuses(p.equipment);
+    const bon = equipBonuses(p);
+    const ngMult = 1 + 0.05 * (p.ngPlus || 0); // +5% max hit per rebirth
     let accuracy, maxHit;
     if (style === "ranged") {
       accuracy = lv.ranged + bon.rng + 6;
@@ -264,7 +316,7 @@ module.exports = function registerGame(app, db, helpers) {
     }
     return {
       style, levels: lv,
-      maxHit: maxHit, accuracy: accuracy,
+      maxHit: Math.max(1, Math.floor(maxHit * ngMult)), accuracy: accuracy,
       defence: lv.defence + bon.def + 6,
       maxHp: 10 + Math.max(0, lv.hitpoints - 10),
       combat: combatLevel(lv),
@@ -295,6 +347,7 @@ module.exports = function registerGame(app, db, helpers) {
     return { win: foeHp <= 0 && myHp > 0, hits, myHp, foeHp };
   }
 
+  function discover(p, id) { if (!p.discovered) p.discovered = {}; p.discovered[id] = 1; }
   function rollLoot(def, p, feedRows, playerName, sourceName) {
     const loot = { coins: 0, items: [] };
     // coins
@@ -304,14 +357,14 @@ module.exports = function registerGame(app, db, helpers) {
     (def.materials || []).forEach((m) => {
       if (Math.random() < m.chance) {
         const q = randInt(m.min, m.max);
-        addItem(p.inventory, m.id, q);
+        addItem(p.inventory, m.id, q); discover(p, m.id);
         loot.items.push({ id: m.id, name: ITEMS[m.id].name, qty: q, kind: "material" });
       }
     });
     // boss gear rolls
     (def.gear || []).forEach((g) => {
       if (Math.random() < g.chance) {
-        addItem(p.inventory, g.id, 1);
+        addItem(p.inventory, g.id, 1); discover(p, g.id);
         const entry = { id: g.id, name: ITEMS[g.id].name, qty: 1, kind: "gear", glow: !!ITEMS[g.id].glow };
         loot.items.push(entry);
         feedRows.push({ item: g.id, itemName: ITEMS[g.id].name, kind: "gear", name: playerName, source: sourceName });
@@ -320,7 +373,7 @@ module.exports = function registerGame(app, db, helpers) {
     // dyes
     (def.dyes || []).forEach((d) => {
       if (Math.random() < d.chance) {
-        addItem(p.inventory, d.id, 1);
+        addItem(p.inventory, d.id, 1); discover(p, d.id);
         const rare = d.id === "dye_prismatic" || d.id === "dye_onyx";
         loot.items.push({ id: d.id, name: ITEMS[d.id].name, qty: 1, kind: "dye", glow: !!ITEMS[d.id].glow });
         if (rare) feedRows.push({ item: d.id, itemName: ITEMS[d.id].name, kind: "dye", name: playerName, source: sourceName });
@@ -328,7 +381,7 @@ module.exports = function registerGame(app, db, helpers) {
     });
     // signature unique — the super-rare, always global
     if (def.unique && Math.random() < def.unique.chance) {
-      addItem(p.inventory, def.unique.id, 1);
+      addItem(p.inventory, def.unique.id, 1); discover(p, def.unique.id);
       loot.items.push({ id: def.unique.id, name: ITEMS[def.unique.id].name, qty: 1, kind: "unique", glow: true });
       feedRows.push({ item: def.unique.id, itemName: ITEMS[def.unique.id].name, kind: "unique", name: playerName, source: sourceName });
     }
@@ -337,6 +390,7 @@ module.exports = function registerGame(app, db, helpers) {
 
   function grantXp(p, foeXp, style) {
     p.skills = normSkills(p.skills);
+    foeXp = Math.round(foeXp * (1 + 0.10 * (p.ngPlus || 0))); // +10% xp per rebirth
     let gains;
     if (style === "ranged") {
       gains = { ranged: Math.round(foeXp * 1.1), defence: Math.round(foeXp * 0.45), hitpoints: Math.round(foeXp * 0.33) };
@@ -372,10 +426,12 @@ module.exports = function registerGame(app, db, helpers) {
     const sk = normSkills(p.skills);
     const skills = {};
     SKILL_KEYS.forEach((k) => { skills[k] = { xp: sk[k], level: pcM.levels[k] }; });
+    const total = totalXpOf(p);
     return {
       name: p.name, coins: p.coins,
       skills: skills,
       combat: pcM.combat, maxHit: pcM.maxHit, maxHp: pcM.maxHp,
+      pl: plFromXp(total), plBar: plBarFor(total), ngPlus: p.ngPlus || 0,
       // authoritative per-style numbers so the client can render live hits/misses
       combatStats: {
         melee: { acc: pcM.accuracy, maxHit: pcM.maxHit },
@@ -384,8 +440,27 @@ module.exports = function registerGame(app, db, helpers) {
         defence: pcM.defence,
       },
       inventory: p.inventory, equipment: p.equipment,
+      weaponUpgrades: p.weaponUpgrades || {}, discovered: p.discovered || {},
+      quest: questView(p), questCooldownMs: Math.max(0, (p.questCooldown || 0) - Date.now()),
       totalKills: p.totalKills, bossKills: p.bossKills,
     };
+  }
+
+  // ---------- quests (from Grandma) ----------
+  const QUEST_COOLDOWN_MS = 90 * 1000; // 1.5 min after completing
+  function questView(p) {
+    if (!p.quest) return null;
+    return { enemy: p.quest.enemy, enemyName: ENEMIES[p.quest.enemy] ? ENEMIES[p.quest.enemy].name : p.quest.enemy,
+      need: p.quest.need, have: p.quest.have, rewardGold: p.quest.rewardGold, done: p.quest.have >= p.quest.need };
+  }
+  function makeQuest(pl) {
+    // pick enemies roughly in range of the player's level
+    const pool = Object.keys(ENEMIES).filter((k) => ENEMIES[k].level <= pl + 12);
+    const list = pool.length ? pool : ["rat"];
+    const enemy = list[Math.floor(Math.random() * list.length)];
+    const need = 5 + Math.floor(pl / 6) + randInt(0, 4);   // ~5–20 scaling with PL
+    const rewardGold = need * (ENEMIES[enemy].xp + 8);
+    return { enemy: enemy, need: need, have: 0, rewardGold: rewardGold };
   }
 
   // xp thresholds so the client can draw progress bars without the whole table
@@ -487,47 +562,143 @@ module.exports = function registerGame(app, db, helpers) {
     });
   });
 
-  // Real-time kill: the client whittles an enemy's HP locally (so it can show
+  // Real-time kill(s): the client whittles enemy HP locally (so it can show
   // hit/miss/block and HP bars), then reports the kill here to be awarded.
-  // Rate-limited per enemy so it can't be spammed faster than a real fight.
+  // Accepts a single `target` or a `targets` array (for AOE magic).
+  // Rate-limited so it can't be spammed faster than a real fight.
   app.post("/api/game/kill", (req, res) => {
     const name = requireSession(req, res); if (!name) return;
     let p = getPlayer(name); if (!p) p = createPlayer(name);
-    const target = typeof req.body.target === "string" ? req.body.target : "";
     let style = typeof req.body.style === "string" ? req.body.style : "melee";
     if (["melee", "ranged", "magic"].indexOf(style) === -1) style = "melee";
-    const isBoss = target === "boss";
-    const def = isBoss ? BOSS : ENEMIES[target];
-    if (!def) return res.status(400).json({ error: "No such enemy" });
+
+    let targets = Array.isArray(req.body.targets) ? req.body.targets.slice(0, 12)
+      : (typeof req.body.target === "string" ? [req.body.target] : []);
+    targets = targets.filter((t) => t === "boss" || ENEMIES[t]);
+    if (!targets.length) return res.status(400).json({ error: "No such enemy" });
 
     const now = Date.now();
-    if (isBoss) {
+    const hasBoss = targets.indexOf("boss") !== -1;
+    if (hasBoss) {
       const bs = bossState(now);
       if (!bs.active) return res.status(400).json({ error: "The boss isn't here right now." });
       if (p.lastBossSpawn === bs.spawnId) return res.status(400).json({ error: "Already defeated this spawn." });
-    } else {
-      // loose floor tied to the enemy's toughness; won't throttle a fast legit kill
-      const minGap = Math.max(250, Math.min(1000, Math.round(def.hp * 5)));
-      if (now - p.lastAction < minGap) return res.status(429).json({ error: "Too fast" });
     }
+    // one global pacing floor per report (AOE counts as one action)
+    const toughest = targets.reduce((mx, t) => Math.max(mx, (t === "boss" ? BOSS.hp : ENEMIES[t].hp)), 0);
+    const minGap = hasBoss ? 0 : Math.max(220, Math.min(1000, Math.round(toughest * 5)));
+    if (now - p.lastAction < minGap) return res.status(429).json({ error: "Too fast" });
 
     const feedRows = [];
-    const xpRes = grantXp(p, def.xp, style);
-    const loot = rollLoot(def, p, feedRows, p.name, def.name);
-    p.totalKills += 1;
+    const totalGains = {};
+    const lootItems = [];
+    const levelUps = [];
+    const seenLvlUp = {};
+    let lootCoins = 0;
+    const questBefore = p.quest ? p.quest.have : 0;
+    targets.forEach((t) => {
+      const isBoss = t === "boss";
+      const def = isBoss ? BOSS : ENEMIES[t];
+      const xr = grantXp(p, def.xp, style);
+      Object.keys(xr.gains).forEach((k) => { totalGains[k] = (totalGains[k] || 0) + xr.gains[k]; });
+      xr.levelUps.forEach((lu) => { seenLvlUp[lu.skill] = lu.level; }); // keep highest per skill
+      const loot = rollLoot(def, p, feedRows, p.name, def.name);
+      lootCoins += loot.coins; loot.items.forEach((it) => lootItems.push(it));
+      p.totalKills += 1;
+      if (isBoss) { p.bossKills += 1; p.lastBossSpawn = bossState(now).spawnId; }
+      // quest progress
+      if (p.quest && p.quest.enemy === t && p.quest.have < p.quest.need) p.quest.have += 1;
+    });
+    Object.keys(seenLvlUp).forEach((k) => levelUps.push({ skill: k, level: seenLvlUp[k] }));
     p.lastAction = now;
-    if (isBoss) { p.bossKills += 1; p.lastBossSpawn = bossState(now).spawnId; }
     if (feedRows.length) pushFeed(feedRows);
     savePlayer(name, p);
 
     const st = publicState(p);
     st.bars = barsFor(p);
     res.json({
-      foeName: def.name, isBoss: isBoss, style: style,
-      xpGains: xpRes.gains, levelUps: xpRes.levelUps,
-      loot: loot, state: st,
+      foeName: targets.length === 1 ? (targets[0] === "boss" ? BOSS.name : ENEMIES[targets[0]].name) : (targets.length + " enemies"),
+      isBoss: hasBoss, style: style, killed: targets.length,
+      xpGains: totalGains, levelUps: levelUps,
+      questAdvanced: p.quest ? (p.quest.have - questBefore) : 0,
+      loot: { coins: lootCoins, items: lootItems }, state: st,
       globalDrops: feedRows.map((r) => ({ item: r.item, itemName: r.itemName, kind: r.kind })),
     });
+  });
+
+  // Anvil: upgrade a weapon you own with gold + its material. +1..+10.
+  app.post("/api/game/upgrade", (req, res) => {
+    const name = requireSession(req, res); if (!name) return;
+    const p = getPlayer(name); if (!p) return res.status(400).json({ error: "No player" });
+    const item = typeof req.body.item === "string" ? req.body.item : "";
+    const it = ITEMS[item];
+    if (!it || it.type !== "weapon") return res.status(400).json({ error: "Not a weapon" });
+    const owns = (p.inventory[item] > 0) || (p.equipment.weapon && p.equipment.weapon.item === item);
+    if (!owns) return res.status(400).json({ error: "You don't own that weapon" });
+    const plus = weaponPlus(p, item);
+    if (plus >= MAX_UPGRADE) return res.status(400).json({ error: "Already max (+" + MAX_UPGRADE + ")" });
+    const cost = upgradeCost(it, plus);
+    if (p.coins < cost.gold) return res.status(400).json({ error: "Not enough gold" });
+    if ((p.inventory[cost.mat] || 0) < cost.matQty) return res.status(400).json({ error: "Need " + cost.matQty + "× " + ITEMS[cost.mat].name });
+    p.coins -= cost.gold;
+    removeItem(p.inventory, cost.mat, cost.matQty);
+    p.weaponUpgrades[item] = plus + 1;
+    savePlayer(name, p);
+    const st = publicState(p); st.bars = barsFor(p);
+    res.json({ ok: true, item: item, plus: plus + 1, state: st });
+  });
+  function upgradeCost(it, plus) {
+    return { gold: Math.round(it.value * 0.6 * (plus + 1)), mat: it.up, matQty: plus + 1 };
+  }
+  // expose cost table for the client anvil UI
+  app.get("/api/game/upgrade-cost", (req, res) => {
+    const name = requireSession(req, res); if (!name) return;
+    const p = getPlayer(name); if (!p) return res.status(400).json({ error: "No player" });
+    const item = String(req.query.item || ""); const it = ITEMS[item];
+    if (!it || it.type !== "weapon") return res.status(400).json({ error: "Not a weapon" });
+    const plus = weaponPlus(p, item);
+    if (plus >= MAX_UPGRADE) return res.json({ item: item, plus: plus, max: true });
+    const c = upgradeCost(it, plus);
+    res.json({ item: item, plus: plus, gold: c.gold, mat: c.mat, matName: ITEMS[c.mat].name, matQty: c.matQty, max: false });
+  });
+
+  // Grandma quests.
+  app.get("/api/game/quest", (req, res) => {
+    const name = requireSession(req, res); if (!name) return;
+    const p = getPlayer(name); if (!p) return res.status(400).json({ error: "No player" });
+    res.json({ quest: questView(p), cooldownMs: Math.max(0, (p.questCooldown || 0) - Date.now()) });
+  });
+  app.post("/api/game/quest/accept", (req, res) => {
+    const name = requireSession(req, res); if (!name) return;
+    const p = getPlayer(name); if (!p) return res.status(400).json({ error: "No player" });
+    if (p.quest) return res.json({ quest: questView(p) });
+    if (Date.now() < (p.questCooldown || 0)) return res.status(400).json({ error: "Grandma needs a rest — come back soon." });
+    p.quest = makeQuest(plFromXp(totalXpOf(p)));
+    savePlayer(name, p);
+    res.json({ quest: questView(p) });
+  });
+  app.post("/api/game/quest/claim", (req, res) => {
+    const name = requireSession(req, res); if (!name) return;
+    const p = getPlayer(name); if (!p) return res.status(400).json({ error: "No player" });
+    if (!p.quest) return res.status(400).json({ error: "No quest" });
+    if (p.quest.have < p.quest.need) return res.status(400).json({ error: "Quest not finished" });
+    const reward = p.quest.rewardGold;
+    p.coins += reward; p.quest = null; p.questCooldown = Date.now() + QUEST_COOLDOWN_MS;
+    savePlayer(name, p);
+    const st = publicState(p); st.bars = barsFor(p);
+    res.json({ ok: true, reward: reward, state: st });
+  });
+
+  // Rebirth at PL 99 → NG+ (keeps items/coins/upgrades, resets skills, +permanent bonuses).
+  app.post("/api/game/rebirth", (req, res) => {
+    const name = requireSession(req, res); if (!name) return;
+    const p = getPlayer(name); if (!p) return res.status(400).json({ error: "No player" });
+    if (plFromXp(totalXpOf(p)) < MAX_LEVEL) return res.status(400).json({ error: "Reach PL 99 first." });
+    p.skills = freshSkills();
+    p.ngPlus = (p.ngPlus || 0) + 1;
+    savePlayer(name, p);
+    const st = publicState(p); st.bars = barsFor(p);
+    res.json({ ok: true, ngPlus: p.ngPlus, state: st });
   });
 
   // Equip an item you own.
@@ -639,14 +810,16 @@ module.exports = function registerGame(app, db, helpers) {
 
   // Leaderboard (top by total level then kills).
   app.get("/api/game/leaderboard", (req, res) => {
-    const rows = db.prepare("SELECT name, skills_json, total_kills, boss_kills FROM game_players").all();
+    const rows = db.prepare("SELECT name, skills_json, total_kills, boss_kills, ng_plus FROM game_players").all();
     const board = rows.map((r) => {
       const s = JSON.parse(r.skills_json);
       const lv = skillLevels(s);
       const total = SKILL_KEYS.reduce((sum, k) => sum + lv[k], 0);
-      return { name: r.name, totalLevel: total, combat: combatLevel(lv), kills: r.total_kills, bossKills: r.boss_kills };
+      const totalXp = SKILL_KEYS.reduce((sum, k) => sum + (s[k] || 0), 0);
+      return { name: r.name, pl: plFromXp(totalXp), ngPlus: r.ng_plus || 0, totalLevel: total,
+        combat: combatLevel(lv), kills: r.total_kills, bossKills: r.boss_kills };
     });
-    board.sort((a, b) => b.totalLevel - a.totalLevel || b.kills - a.kills);
+    board.sort((a, b) => (b.ngPlus - a.ngPlus) || (b.pl - a.pl) || (b.totalLevel - a.totalLevel) || (b.kills - a.kills));
     res.json(board.slice(0, 25));
   });
 };
