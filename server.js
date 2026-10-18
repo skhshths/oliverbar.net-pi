@@ -247,7 +247,7 @@ app.use(express.json({ limit: "256kb" }));
 app.use((req, res, next) => {
   res.set("Access-Control-Allow-Origin", ALLOW_ORIGIN);
   res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.set("Access-Control-Allow-Headers", "Content-Type, X-Edit-Key, X-Chat-Session");
+  res.set("Access-Control-Allow-Headers", "Content-Type, X-Edit-Key, X-Chat-Session, X-Ultra-Admin");
   if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
@@ -951,6 +951,84 @@ app.post("/api/downloads/count", (req, res) => {
   const info = db.prepare("INSERT OR IGNORE INTO downloads (device, platform, ts) VALUES (?,?,?)")
     .run(device, platform, Date.now());
   res.json(Object.assign({ counted: info.changes === 1 }, downloadCounts()));
+});
+
+// ---------- ULTRA feedback + admin panel (admin.oliverbar.net) ----------
+// Only the SHA-256 of the admin password lives here; the password itself is
+// a 32-char random string that isn't stored anywhere.
+const ULTRA_ADMIN_HASH = process.env.ULTRA_ADMIN_HASH ||
+  "233f315d89e47fcfb08f829fb0f4165c4cc4a5e2a3945afbad510f4ce2b6c9f4";
+db.exec(`CREATE TABLE IF NOT EXISTS feedback (
+  id TEXT PRIMARY KEY, kind TEXT, message TEXT NOT NULL, contact TEXT,
+  platform TEXT, ua TEXT, ts INTEGER NOT NULL, read INTEGER DEFAULT 0
+)`);
+db.exec("CREATE INDEX IF NOT EXISTS idx_downloads_ts ON downloads (ts)");
+
+const feedbackHits = new Map(); // ip -> [timestamps], simple spam brake
+function clientIp(req) {
+  return (req.get("CF-Connecting-IP") || req.get("X-Forwarded-For") || req.ip || "").split(",")[0].trim();
+}
+app.post("/api/feedback", (req, res) => {
+  const b = req.body || {};
+  const message = typeof b.message === "string" ? b.message.trim().slice(0, 2000) : "";
+  if (message.length < 3) return res.status(400).json({ error: "Please write a little more." });
+  const kind = ["bug", "idea", "other"].indexOf(b.kind) !== -1 ? b.kind : "other";
+  const contact = typeof b.contact === "string" ? b.contact.trim().slice(0, 120) : "";
+  const platform = ["windows", "mac", "other"].indexOf(b.platform) !== -1 ? b.platform : "other";
+  const ip = clientIp(req), now = Date.now();
+  const recent = (feedbackHits.get(ip) || []).filter((t) => now - t < 10 * 60 * 1000);
+  if (recent.length >= 5) return res.status(429).json({ error: "That's a lot of feedback — try again in a few minutes." });
+  recent.push(now); feedbackHits.set(ip, recent);
+  db.prepare("INSERT INTO feedback (id, kind, message, contact, platform, ua, ts) VALUES (?,?,?,?,?,?,?)")
+    .run(randomHex(8), kind, message, contact, platform, String(req.get("User-Agent") || "").slice(0, 200), now);
+  res.json({ ok: true });
+});
+
+function requireUltraAdmin(req, res) {
+  const given = String(req.get("X-Ultra-Admin") || "");
+  const h = crypto.createHash("sha256").update(given).digest("hex");
+  if (!given || !timingSafeEqual(h, ULTRA_ADMIN_HASH)) { res.status(401).json({ error: "Wrong password" }); return false; }
+  return true;
+}
+app.get("/api/ultra-admin/overview", (req, res) => {
+  if (!requireUltraAdmin(req, res)) return;
+  const DAY = 86400000, now = Date.now(), since = now - 30 * DAY;
+  const rows = db.prepare("SELECT platform, ts FROM downloads WHERE ts >= ?").all(since);
+  const days = [];
+  for (let i = 29; i >= 0; i--) {
+    const d = new Date(now - i * DAY); d.setHours(0, 0, 0, 0);
+    days.push({ day: d.getTime(), windows: 0, mac: 0 });
+  }
+  rows.forEach((r) => {
+    const d = new Date(r.ts); d.setHours(0, 0, 0, 0);
+    const slot = days.find((x) => x.day === d.getTime());
+    if (slot && (r.platform === "windows" || r.platform === "mac")) slot[r.platform]++;
+  });
+  const fb = db.prepare("SELECT COUNT(*) AS c, SUM(CASE WHEN read=0 THEN 1 ELSE 0 END) AS u FROM feedback").get();
+  res.json({
+    downloads: downloadCounts(),
+    last24h: db.prepare("SELECT COUNT(*) AS c FROM downloads WHERE ts >= ?").get(now - DAY).c,
+    last7d: db.prepare("SELECT COUNT(*) AS c FROM downloads WHERE ts >= ?").get(now - 7 * DAY).c,
+    daily: days,
+    feedback: { total: fb.c || 0, unread: fb.u || 0 },
+  });
+});
+app.get("/api/ultra-admin/feedback", (req, res) => {
+  if (!requireUltraAdmin(req, res)) return;
+  res.json(db.prepare("SELECT id, kind, message, contact, platform, ua, ts, read FROM feedback ORDER BY ts DESC LIMIT 500").all());
+});
+app.post("/api/ultra-admin/feedback/read", (req, res) => {
+  if (!requireUltraAdmin(req, res)) return;
+  const id = String((req.body && req.body.id) || "");
+  const read = req.body && req.body.read === false ? 0 : 1;
+  if (id === "*") db.prepare("UPDATE feedback SET read = 1").run();
+  else db.prepare("UPDATE feedback SET read = ? WHERE id = ?").run(read, id);
+  res.json({ ok: true });
+});
+app.post("/api/ultra-admin/feedback/delete", (req, res) => {
+  if (!requireUltraAdmin(req, res)) return;
+  db.prepare("DELETE FROM feedback WHERE id = ?").run(String((req.body && req.body.id) || ""));
+  res.json({ ok: true });
 });
 
 require("./game")(app, db, { requireSession, randomHex });
