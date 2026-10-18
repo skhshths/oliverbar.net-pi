@@ -924,6 +924,35 @@ app.get("/api/admin/system", (req, res) => {
 });
 
 // ---------- RPG game (oliverbar.net/game) ----------
+// ---------- ULTRA download counter (oliverbar.net) ----------
+// One count per device per platform: the page sends a random per-browser id
+// (kept in localStorage), and the (device, platform) primary key makes repeat
+// downloads from the same machine a no-op.
+db.exec(`CREATE TABLE IF NOT EXISTS downloads (
+  device TEXT NOT NULL, platform TEXT NOT NULL, ts INTEGER NOT NULL,
+  PRIMARY KEY (device, platform)
+)`);
+function downloadCounts() {
+  const rows = db.prepare("SELECT platform, COUNT(*) AS c FROM downloads GROUP BY platform").all();
+  const out = { windows: 0, mac: 0 };
+  rows.forEach((r) => { if (r.platform in out) out[r.platform] = r.c; });
+  out.total = out.windows + out.mac;
+  return out;
+}
+app.get("/api/downloads", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.json(downloadCounts());
+});
+app.post("/api/downloads/count", (req, res) => {
+  const platform = req.body && req.body.platform;
+  const device = req.body && typeof req.body.device === "string" ? req.body.device : "";
+  if (platform !== "windows" && platform !== "mac") return res.status(400).json({ error: "bad platform" });
+  if (!/^[a-zA-Z0-9-]{16,64}$/.test(device)) return res.status(400).json({ error: "bad device" });
+  const info = db.prepare("INSERT OR IGNORE INTO downloads (device, platform, ts) VALUES (?,?,?)")
+    .run(device, platform, Date.now());
+  res.json(Object.assign({ counted: info.changes === 1 }, downloadCounts()));
+});
+
 require("./game")(app, db, { requireSession, randomHex });
 
 app.use((err, req, res, next) => {
