@@ -1105,7 +1105,7 @@ async function experimentalKey() {
   let r;
   try { r = await ghRequest(`/repos/${EXP_REPO}/contents/EXPERIMENTAL_KEY.txt`, "application/vnd.github.raw"); }
   catch (e) { r = { status: 0 }; if (e.notConfigured) throw e; }
-  if (r.status === 404) { expCache.key = null; throw new Error("key file missing"); } // removed → lock everyone out
+  if (r.status === 404) { expCache.key = null; verifiedDevices.clear(); throw new Error("key file missing"); } // removed → lock everyone out
   const key = r.status === 200 ? r.body.trim() : "";
   if (r.status !== 200 || key.length < 16) {
     // GitHub hiccup: keep the last good key only for a short grace period, then fail closed.
@@ -1113,6 +1113,7 @@ async function experimentalKey() {
     expCache.key = null;
     throw new Error("key fetch " + r.status);
   }
+  if (expCache.key && expCache.key !== key) { verifiedDevices.clear(); deviceFails.clear(); } // rotated: start over
   expCache.key = key; expCache.keyAt = Date.now();
   return expCache.key;
 }
@@ -1145,13 +1146,23 @@ const keyFails = new Map(); // ip -> [timestamps of wrong keys]
 setInterval(() => {
   const now = Date.now();
   for (const [ip, ts] of keyFails) if (!ts.some((t) => now - t < FEEDBACK_WINDOW_MS)) keyFails.delete(ip);
+  for (const [d, ts] of deviceFails) if (!ts.some((t) => now - t < FEEDBACK_WINDOW_MS)) deviceFails.delete(d);
+  for (const [d, t] of verifiedDevices) if (now - t > VERIFIED_TTL_MS) verifiedDevices.delete(d);
 }, 5 * 60 * 1000).unref();
 
 let globalKeyFails = []; // timestamps across all IPs — backstop if someone rotates addresses
 // Devices that have entered the right key before. During a flood that trips the
 // global cap, these keep working, so an attacker can't lock real testers out.
 // (Device ids are random per-browser UUIDs, so they can't be guessed.)
-const verifiedDevices = new Map(); // device -> last success ts
+const verifiedDevices = new Map(); // device -> last success ts (exempt for 30 days)
+const deviceFails = new Map();     // device -> [wrong-key timestamps]
+const VERIFIED_TTL_MS = 30 * 86400000;
+function isVerifiedDevice(device) {
+  const t = verifiedDevices.get(device);
+  if (!t) return false;
+  if (Date.now() - t > VERIFIED_TTL_MS) { verifiedDevices.delete(device); return false; }
+  return true;
+}
 function rememberDevice(device) {
   verifiedDevices.set(device, Date.now());
   if (verifiedDevices.size > 20000) { // keep memory bounded: drop the oldest half
@@ -1168,20 +1179,26 @@ app.post("/api/experimental/verify", async (req, res) => {
   // all see it. It's only removed again if the key turns out to be correct.
   const fails = (keyFails.get(ip) || []).filter((t) => now - t < FEEDBACK_WINDOW_MS);
   globalKeyFails = globalKeyFails.filter((t) => now - t < FEEDBACK_WINDOW_MS);
-  const globalTripped = globalKeyFails.length >= 300 && !verifiedDevices.has(device);
-  if (fails.length >= 10 || globalTripped) {
+  const exempt = isVerifiedDevice(device);
+  const dFails = (deviceFails.get(device) || []).filter((t) => now - t < FEEDBACK_WINDOW_MS);
+  const globalTripped = globalKeyFails.length >= 300 && !exempt;
+  if (fails.length >= 10 || globalTripped || (exempt && dFails.length >= 5)) {
     keyFails.set(ip, fails);
     return res.status(429).json({ error: "Too many wrong keys — wait a few minutes and try again." });
   }
-  fails.push(now); keyFails.set(ip, fails); globalKeyFails.push(now);
+  fails.push(now); keyFails.set(ip, fails);
+  if (exempt) { dFails.push(now); deviceFails.set(device, dFails); } // exempt devices: own strict counter,
+  else globalKeyFails.push(now);                                       // and they don't feed the global cap
   const forgive = () => { // correct key (or server-side failure): un-count this attempt
     const i = fails.lastIndexOf(now); if (i !== -1) fails.splice(i, 1);
-    const g = globalKeyFails.lastIndexOf(now); if (g !== -1) globalKeyFails.splice(g, 1);
+    const g = globalKeyFails.lastIndexOf(now); if (g !== -1 && !exempt) globalKeyFails.splice(g, 1);
+    const d = dFails.lastIndexOf(now); if (d !== -1 && exempt) dFails.splice(d, 1);
   };
   try {
     const real = await experimentalKey();
     const h = (s) => crypto.createHash("sha256").update(s).digest("hex"); // equal-length compare
     if (!key || !timingSafeEqual(h(key), h(real))) {
+      if (exempt) verifiedDevices.delete(device); // one wrong guess and the exemption is gone
       return res.status(401).json({ error: "That key isn't right." });
     }
     forgive();
