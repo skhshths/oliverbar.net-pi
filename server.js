@@ -1102,9 +1102,18 @@ function ghRequest(apiPath, accept) {
 const expCache = { key: null, keyAt: 0, release: null, relAt: 0 };
 async function experimentalKey() {
   if (expCache.key && Date.now() - expCache.keyAt < 5 * 60 * 1000) return expCache.key;
-  const r = await ghRequest(`/repos/${EXP_REPO}/contents/EXPERIMENTAL_KEY.txt`, "application/vnd.github.raw");
-  if (r.status !== 200) { if (expCache.key) return expCache.key; throw new Error("key fetch " + r.status); }
-  expCache.key = r.body.trim(); expCache.keyAt = Date.now();
+  let r;
+  try { r = await ghRequest(`/repos/${EXP_REPO}/contents/EXPERIMENTAL_KEY.txt`, "application/vnd.github.raw"); }
+  catch (e) { r = { status: 0 }; if (e.notConfigured) throw e; }
+  if (r.status === 404) { expCache.key = null; throw new Error("key file missing"); } // removed → lock everyone out
+  const key = r.status === 200 ? r.body.trim() : "";
+  if (r.status !== 200 || key.length < 16) {
+    // GitHub hiccup: keep the last good key only for a short grace period, then fail closed.
+    if (expCache.key && Date.now() - expCache.keyAt < 15 * 60 * 1000) return expCache.key;
+    expCache.key = null;
+    throw new Error("key fetch " + r.status);
+  }
+  expCache.key = key; expCache.keyAt = Date.now();
   return expCache.key;
 }
 async function experimentalRelease() {
@@ -1138,20 +1147,32 @@ setInterval(() => {
   for (const [ip, ts] of keyFails) if (!ts.some((t) => now - t < FEEDBACK_WINDOW_MS)) keyFails.delete(ip);
 }, 5 * 60 * 1000).unref();
 
+let globalKeyFails = []; // timestamps across all IPs — backstop if someone rotates addresses
 app.post("/api/experimental/verify", async (req, res) => {
   const ip = clientIp(req), now = Date.now();
-  const fails = (keyFails.get(ip) || []).filter((t) => now - t < FEEDBACK_WINDOW_MS);
-  if (fails.length >= 10) return res.status(429).json({ error: "Too many wrong keys — wait a few minutes and try again." });
   const key = typeof (req.body && req.body.key) === "string" ? req.body.key.trim() : "";
   const device = typeof (req.body && req.body.device) === "string" ? req.body.device : "";
   if (!/^[a-zA-Z0-9-]{16,64}$/.test(device)) return res.status(400).json({ error: "bad device" });
+  // Record this attempt synchronously, BEFORE any await, so concurrent requests
+  // all see it. It's only removed again if the key turns out to be correct.
+  const fails = (keyFails.get(ip) || []).filter((t) => now - t < FEEDBACK_WINDOW_MS);
+  globalKeyFails = globalKeyFails.filter((t) => now - t < FEEDBACK_WINDOW_MS);
+  if (fails.length >= 10 || globalKeyFails.length >= 300) {
+    keyFails.set(ip, fails);
+    return res.status(429).json({ error: "Too many wrong keys — wait a few minutes and try again." });
+  }
+  fails.push(now); keyFails.set(ip, fails); globalKeyFails.push(now);
+  const forgive = () => { // correct key (or server-side failure): un-count this attempt
+    const i = fails.lastIndexOf(now); if (i !== -1) fails.splice(i, 1);
+    const g = globalKeyFails.lastIndexOf(now); if (g !== -1) globalKeyFails.splice(g, 1);
+  };
   try {
     const real = await experimentalKey();
     const h = (s) => crypto.createHash("sha256").update(s).digest("hex"); // equal-length compare
     if (!key || !timingSafeEqual(h(key), h(real))) {
-      fails.push(now); keyFails.set(ip, fails);
       return res.status(401).json({ error: "That key isn't right." });
     }
+    forgive();
     const rel = await experimentalRelease();
     res.json({ ok: true, ticket: signTicket(device), release: {
       name: rel.name, tag: rel.tag, published: rel.published,
@@ -1159,6 +1180,7 @@ app.post("/api/experimental/verify", async (req, res) => {
       mac: rel.assets.mac ? { size: rel.assets.mac.size } : null,
     } });
   } catch (e) {
+    forgive(); // our fault, not a wrong guess
     console.error("experimental verify:", e.message);
     res.status(503).json({ error: e.notConfigured ? "Experimental downloads aren't set up on the server yet." : "Couldn't reach GitHub — try again in a moment." });
   }
