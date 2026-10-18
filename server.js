@@ -1081,14 +1081,17 @@ db.exec(`CREATE TABLE IF NOT EXISTS exp_downloads (
   PRIMARY KEY (device, platform)
 )`);
 
-function ghRequest(apiPath, accept) {
+// publicOk: for public repos, go unauthenticated if there's no token.
+function ghRequest(apiPath, accept, publicOk) {
   return new Promise((resolve, reject) => {
     const token = process.env.GITHUB_EXPERIMENTAL_TOKEN;
-    if (!token) return reject(Object.assign(new Error("not configured"), { notConfigured: true }));
+    if (!token && !publicOk) return reject(Object.assign(new Error("not configured"), { notConfigured: true }));
+    const headers = { "Accept": accept || "application/vnd.github+json",
+      "User-Agent": "oliverbar-pi", "X-GitHub-Api-Version": "2022-11-28" };
+    if (token) headers.Authorization = "Bearer " + token;
     const req = https.request({
       host: "api.github.com", path: apiPath, method: "GET",
-      headers: { "Authorization": "Bearer " + token, "Accept": accept || "application/vnd.github+json",
-        "User-Agent": "oliverbar-pi", "X-GitHub-Api-Version": "2022-11-28" },
+      headers: headers,
     }, (res) => {
       let body = "";
       res.on("data", (c) => { if (body.length < 2e6) body += c; });
@@ -1204,7 +1207,9 @@ app.post("/api/experimental/verify", async (req, res) => {
     forgive();
     rememberDevice(device);
     const rel = await experimentalRelease();
-    res.json({ ok: true, ticket: signTicket(device), release: {
+    let changelog = null;
+    try { changelog = (await buildChangelog("experimental")).releases; } catch (x) { /* optional */ }
+    res.json({ ok: true, ticket: signTicket(device), changelog: changelog, release: {
       name: rel.name, tag: rel.tag, published: rel.published,
       windows: rel.assets.windows ? { size: rel.assets.windows.size } : null,
       mac: rel.assets.mac ? { size: rel.assets.mac.size } : null,
@@ -1214,6 +1219,74 @@ app.post("/api/experimental/verify", async (req, res) => {
     console.error("experimental verify:", e.message);
     res.status(503).json({ error: e.notConfigured ? "Experimental downloads aren't set up on the server yet." : "Couldn't reach GitHub — try again in a moment." });
   }
+});
+
+
+// ---------- Changelogs: "updated X ago" + what changed, built from commits ----------
+// Release notes are install boilerplate, but commit subjects read like a
+// changelog ("Typing no longer loses focus at random"). Each release's entries
+// are the commits since the previous release, split on "; ", with dev-only
+// notes (test harnesses, hand-off sheets, site plumbing) filtered out.
+const CHANGELOG_TTL_MS = 10 * 60 * 1000;
+const changelogCache = {};
+const NOISE = /harness|sign-?out (sheet|notes)|next agent|\bbench\b|readme|\bci\b|workflow|oliverbar\.net|download key|type-check|typo|fix the build/i;
+function cleanItems(messages, channel) {
+  const out = [], seen = new Set();
+  messages.forEach((m) => {
+    const subject = String(m || "").split("\n")[0].trim();
+    if (!subject || /^merge\b/i.test(subject)) return;
+    subject.split(/;\s+/).forEach((part) => {
+      let t = part.replace(/\s*\[(mac|skip ci|ci skip)\]\s*/gi, " ").replace(/\s+/g, " ").trim().replace(/[.;]+$/, "");
+      if (t.length < 4 || NOISE.test(t)) return;
+      if (channel === "stable" && /experimental/i.test(t)) return; // that's about the other build
+      t = t.charAt(0).toUpperCase() + t.slice(1);
+      const k = t.toLowerCase();
+      if (!seen.has(k)) { seen.add(k); out.push(t); }
+    });
+  });
+  return out.slice(0, 7);
+}
+async function buildChangelog(channel) {
+  const c = changelogCache[channel];
+  if (c && Date.now() - c.at < CHANGELOG_TTL_MS) return c.data;
+  const repo = channel === "stable" ? "skhshths/ULTRA" : EXP_REPO;
+  const publicOk = channel === "stable";
+  try {
+    const r = await ghRequest(`/repos/${repo}/releases?per_page=10`, null, publicOk);
+    if (r.status !== 200) throw new Error("releases " + r.status);
+    const rels = JSON.parse(r.body).filter((x) => !x.draft);
+    const entries = [];
+    for (let i = 0; i < Math.min(3, rels.length); i++) {
+      const head = rels[i].tag_name, base = rels[i + 1] && rels[i + 1].tag_name;
+      let msgs = [];
+      const cr = base
+        ? await ghRequest(`/repos/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`, null, publicOk)
+        : await ghRequest(`/repos/${repo}/commits?sha=${encodeURIComponent(head)}&per_page=10`, null, publicOk);
+      if (cr.status === 200) {
+        const j = JSON.parse(cr.body);
+        msgs = (base ? (j.commits || []) : j).map((x) => x.commit.message);
+        if (base) msgs.reverse(); // compare lists oldest first; show newest first
+      }
+      entries.push({ name: rels[i].name || head, tag: head, published: rels[i].published_at,
+        url: channel === "stable" ? rels[i].html_url : undefined, changes: cleanItems(msgs, channel) });
+    }
+    const data = { latest: entries[0] ? { name: entries[0].name, tag: entries[0].tag, published: entries[0].published } : null, releases: entries };
+    changelogCache[channel] = { at: Date.now(), data };
+    return data;
+  } catch (e) {
+    if (c) return c.data; // serve stale rather than nothing
+    throw e;
+  }
+}
+app.get("/api/changelog/stable", async (req, res) => {
+  try { res.set("Cache-Control", "public, max-age=120"); res.json(await buildChangelog("stable")); }
+  catch (e) { console.error("changelog stable:", e.message); res.status(502).json({ error: "Couldn't reach GitHub" }); }
+});
+// Public: only when the experimental build last updated. What changed is
+// handed out with the download ticket (see /api/experimental/verify).
+app.get("/api/changelog/experimental", async (req, res) => {
+  try { const d = await buildChangelog("experimental"); res.set("Cache-Control", "public, max-age=120"); res.json({ latest: d.latest }); }
+  catch (e) { res.status(e.notConfigured ? 503 : 502).json({ error: "unavailable" }); }
 });
 
 // Browser downloads need a plain GET link, so the ticket rides in the URL.
