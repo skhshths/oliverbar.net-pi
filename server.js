@@ -984,7 +984,11 @@ const FEEDBACK_DAILY_CAP = 300; // global ceiling so a flood can't fill the disk
 // CF-Connecting-IP is written by Cloudflare and can't be forged by a client.
 // (X-Forwarded-For is deliberately ignored — it's client-controlled.)
 function clientIp(req) {
-  return String(req.get("CF-Connecting-IP") || "unknown").trim().slice(0, 64);
+  const peer = String((req.socket && req.socket.remoteAddress) || "");
+  const viaTunnel = /^(127\.|::1$|::ffff:127\.)/.test(peer);
+  // Only the local cloudflared tunnel may tell us the visitor's IP.
+  if (viaTunnel && req.get("CF-Connecting-IP")) return String(req.get("CF-Connecting-IP")).trim().slice(0, 64);
+  return peer.slice(0, 64) || "unknown";
 }
 setInterval(() => {
   const now = Date.now();
@@ -1370,10 +1374,12 @@ app.post("/api/experimental/request", async (req, res) => {
   if (today >= 150) return res.status(429).json({ error: "Lots of requests today — please try again tomorrow." });
   hits.push(now); requestHits.set(ip, hits);
 
-  // Already asked with this GitHub account? Don't reveal that request's
-  // status/id to whoever typed the name — just say it's on file.
-  const existing = db.prepare("SELECT 1 FROM exp_requests WHERE github_key = ? AND status IN ('pending','approved') LIMIT 1").get(github.toLowerCase());
-  if (existing) return res.status(409).json({ error: "There's already a request on file for @" + github + ". If it's yours, the page you sent it from shows its status." });
+  // A request isn't proof of owning the GitHub account, so a duplicate never
+  // blocks anyone (that would let a stranger squat your username). Approving
+  // only ever invites the real account. Cap open requests per username so
+  // one name can't be flooded; the admin sees every request for it.
+  const openForName = db.prepare("SELECT COUNT(*) AS c FROM exp_requests WHERE github_key = ? AND status = 'pending'").get(github.toLowerCase()).c;
+  if (openForName >= 3) return res.status(429).json({ error: "There are already several open requests for @" + github + " — we'll get to them soon." });
 
   // Check the GitHub account exists (anonymously; if GitHub is down, accept unverified).
   let verified = 0, avatar = "", canonical = github;
