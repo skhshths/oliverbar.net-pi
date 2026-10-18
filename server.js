@@ -19,6 +19,19 @@ const { execSync } = require("child_process");
 const express = require("express");
 const Database = require("better-sqlite3");
 const multer = require("multer");
+const https = require("https");
+
+// Load KEY=value lines from a .env next to this file (without overriding
+// anything systemd already set), so secrets can live in ~/misc/pi-api/.env.
+(function loadDotEnv() {
+  try {
+    fs.readFileSync(path.join(__dirname, ".env"), "utf8").split(/\r?\n/).forEach((line) => {
+      const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+      if (!m || process.env[m[1]] !== undefined) return;
+      process.env[m[1]] = m[2].replace(/^(['"])(.*)\1$/, "$2");
+    });
+  } catch (e) { /* no .env — fine */ }
+})();
 
 // ---------- config ----------
 const PORT = Number(process.env.PORT || 8081);
@@ -1024,6 +1037,16 @@ app.get("/api/ultra-admin/overview", (req, res) => {
     last7d: db.prepare("SELECT COUNT(*) AS c FROM downloads WHERE ts >= ?").get(now - 7 * DAY).c,
     daily: days,
     feedback: { total: fb.c || 0, unread: fb.u || 0 },
+    experimental: (() => {
+      const e = { windows: 0, mac: 0 };
+      try {
+        db.prepare("SELECT platform, COUNT(*) AS c FROM exp_downloads GROUP BY platform").all()
+          .forEach((r) => { if (r.platform in e) e[r.platform] = r.c; });
+      } catch (x) { /* table created further down on first boot */ }
+      e.total = e.windows + e.mac;
+      e.configured = !!process.env.GITHUB_EXPERIMENTAL_TOKEN;
+      return e;
+    })(),
   });
 });
 app.get("/api/ultra-admin/feedback", (req, res) => {
@@ -1042,6 +1065,127 @@ app.post("/api/ultra-admin/feedback/delete", (req, res) => {
   if (!requireUltraAdmin(req, res)) return;
   db.prepare("DELETE FROM feedback WHERE id = ?").run(String((req.body && req.body.id) || ""));
   res.json({ ok: true });
+});
+
+// ---------- ULTRA Experimental: key-gated downloads (oliverbar.net/experimental) ----------
+// The builds live in the PRIVATE repo skhshths/ULTRA-experimental, so they can
+// only be fetched with a GitHub token. That token stays on the Pi (.env:
+// GITHUB_EXPERIMENTAL_TOKEN, read-only). The key itself is read from
+// EXPERIMENTAL_KEY.txt in that repo, so editing that file rotates the key.
+const EXP_REPO = process.env.EXPERIMENTAL_REPO || "skhshths/ULTRA-experimental";
+const EXP_ASSETS = { windows: "ULTRA-windows-x64.exe", mac: "ULTRA-macos.zip" };
+const TICKET_SECRET = crypto.randomBytes(32); // tickets die on restart — fine, they last 10 min
+const TICKET_TTL_MS = 10 * 60 * 1000;
+db.exec(`CREATE TABLE IF NOT EXISTS exp_downloads (
+  device TEXT NOT NULL, platform TEXT NOT NULL, ts INTEGER NOT NULL, release TEXT,
+  PRIMARY KEY (device, platform)
+)`);
+
+function ghRequest(apiPath, accept) {
+  return new Promise((resolve, reject) => {
+    const token = process.env.GITHUB_EXPERIMENTAL_TOKEN;
+    if (!token) return reject(Object.assign(new Error("not configured"), { notConfigured: true }));
+    const req = https.request({
+      host: "api.github.com", path: apiPath, method: "GET",
+      headers: { "Authorization": "Bearer " + token, "Accept": accept || "application/vnd.github+json",
+        "User-Agent": "oliverbar-pi", "X-GitHub-Api-Version": "2022-11-28" },
+    }, (res) => {
+      let body = "";
+      res.on("data", (c) => { if (body.length < 2e6) body += c; });
+      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body }));
+    });
+    req.on("error", reject);
+    req.setTimeout(15000, () => req.destroy(new Error("GitHub timed out")));
+    req.end();
+  });
+}
+const expCache = { key: null, keyAt: 0, release: null, relAt: 0 };
+async function experimentalKey() {
+  if (expCache.key && Date.now() - expCache.keyAt < 5 * 60 * 1000) return expCache.key;
+  const r = await ghRequest(`/repos/${EXP_REPO}/contents/EXPERIMENTAL_KEY.txt`, "application/vnd.github.raw");
+  if (r.status !== 200) { if (expCache.key) return expCache.key; throw new Error("key fetch " + r.status); }
+  expCache.key = r.body.trim(); expCache.keyAt = Date.now();
+  return expCache.key;
+}
+async function experimentalRelease() {
+  if (expCache.release && Date.now() - expCache.relAt < 2 * 60 * 1000) return expCache.release;
+  const r = await ghRequest(`/repos/${EXP_REPO}/releases/latest`);
+  if (r.status !== 200) { if (expCache.release) return expCache.release; throw new Error("release fetch " + r.status); }
+  const j = JSON.parse(r.body);
+  const rel = { name: j.name || j.tag_name, tag: j.tag_name, published: j.published_at, assets: {} };
+  (j.assets || []).forEach((a) => {
+    for (const p in EXP_ASSETS) if (a.name === EXP_ASSETS[p]) rel.assets[p] = { id: a.id, name: a.name, size: a.size };
+  });
+  expCache.release = rel; expCache.relAt = Date.now();
+  return rel;
+}
+function signTicket(device) {
+  const payload = Buffer.from(JSON.stringify({ d: device, e: Date.now() + TICKET_TTL_MS })).toString("base64url");
+  const sig = crypto.createHmac("sha256", TICKET_SECRET).update(payload).digest("base64url");
+  return payload + "." + sig;
+}
+function readTicket(t) {
+  const [payload, sig] = String(t || "").split(".");
+  if (!payload || !sig) return null;
+  const want = crypto.createHmac("sha256", TICKET_SECRET).update(payload).digest("base64url");
+  if (!timingSafeEqual(sig, want)) return null;
+  try { const o = JSON.parse(Buffer.from(payload, "base64url").toString()); return o.e > Date.now() ? o : null; }
+  catch (e) { return null; }
+}
+const keyFails = new Map(); // ip -> [timestamps of wrong keys]
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, ts] of keyFails) if (!ts.some((t) => now - t < FEEDBACK_WINDOW_MS)) keyFails.delete(ip);
+}, 5 * 60 * 1000).unref();
+
+app.post("/api/experimental/verify", async (req, res) => {
+  const ip = clientIp(req), now = Date.now();
+  const fails = (keyFails.get(ip) || []).filter((t) => now - t < FEEDBACK_WINDOW_MS);
+  if (fails.length >= 10) return res.status(429).json({ error: "Too many wrong keys — wait a few minutes and try again." });
+  const key = typeof (req.body && req.body.key) === "string" ? req.body.key.trim() : "";
+  const device = typeof (req.body && req.body.device) === "string" ? req.body.device : "";
+  if (!/^[a-zA-Z0-9-]{16,64}$/.test(device)) return res.status(400).json({ error: "bad device" });
+  try {
+    const real = await experimentalKey();
+    const h = (s) => crypto.createHash("sha256").update(s).digest("hex"); // equal-length compare
+    if (!key || !timingSafeEqual(h(key), h(real))) {
+      fails.push(now); keyFails.set(ip, fails);
+      return res.status(401).json({ error: "That key isn't right." });
+    }
+    const rel = await experimentalRelease();
+    res.json({ ok: true, ticket: signTicket(device), release: {
+      name: rel.name, tag: rel.tag, published: rel.published,
+      windows: rel.assets.windows ? { size: rel.assets.windows.size } : null,
+      mac: rel.assets.mac ? { size: rel.assets.mac.size } : null,
+    } });
+  } catch (e) {
+    console.error("experimental verify:", e.message);
+    res.status(503).json({ error: e.notConfigured ? "Experimental downloads aren't set up on the server yet." : "Couldn't reach GitHub — try again in a moment." });
+  }
+});
+
+// Browser downloads need a plain GET link, so the ticket rides in the URL.
+// We never stream the file ourselves: GitHub answers the token-authenticated
+// asset request with a short-lived signed URL, and we send the browser there.
+app.get("/api/experimental/download/:platform", async (req, res) => {
+  const platform = req.params.platform;
+  if (!EXP_ASSETS[platform]) return res.status(404).send("Unknown platform");
+  const t = readTicket(req.query.t);
+  if (!t) return res.status(403).send("This download link has expired. Go back to oliverbar.net/experimental and enter the key again.");
+  try {
+    const rel = await experimentalRelease();
+    const asset = rel.assets[platform];
+    if (!asset) return res.status(404).send("No " + platform + " build in the latest experimental release.");
+    const r = await ghRequest(`/repos/${EXP_REPO}/releases/assets/${asset.id}`, "application/octet-stream");
+    if (r.status < 300 || r.status >= 400 || !r.headers.location) throw new Error("asset fetch " + r.status);
+    db.prepare("INSERT OR IGNORE INTO exp_downloads (device, platform, ts, release) VALUES (?,?,?,?)")
+      .run(t.d, platform, Date.now(), rel.tag);
+    res.set("Cache-Control", "no-store");
+    res.redirect(302, r.headers.location);
+  } catch (e) {
+    console.error("experimental download:", e.message);
+    res.status(502).send("Couldn't fetch the build from GitHub — try again in a moment.");
+  }
 });
 
 require("./game")(app, db, { requireSession, randomHex });

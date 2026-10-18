@@ -63,3 +63,15 @@ cloudflared.
 
 The server binds to `127.0.0.1` only — it is never directly reachable; the
 tunnel is the sole way in, same as the terminal.
+
+## ULTRA Experimental downloads
+
+`oliverbar.net/experimental` hands out builds from the private repo
+`skhshths/ULTRA-experimental` after checking the key in that repo's
+`EXPERIMENTAL_KEY.txt`. The Pi needs a **read-only** GitHub token to do that.
+Put it in `.env` next to `server.js` (loaded automatically) and restart:
+
+    GITHUB_EXPERIMENTAL_TOKEN=github_pat_xxx
+
+Create it at github.com → Settings → Developer settings → Fine-grained tokens:
+repository access = only `ULTRA-experimental`, permission Contents = Read-only.
