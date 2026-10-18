@@ -1047,6 +1047,10 @@ app.get("/api/ultra-admin/overview", (req, res) => {
       e.configured = !!process.env.GITHUB_EXPERIMENTAL_TOKEN;
       return e;
     })(),
+    requests: (() => {
+      try { return { pending: db.prepare("SELECT COUNT(*) AS c FROM exp_requests WHERE status='pending'").get().c }; }
+      catch (x) { return { pending: 0 }; }
+    })(),
   });
 });
 app.get("/api/ultra-admin/feedback", (req, res) => {
@@ -1303,6 +1307,134 @@ app.get("/api/changelog/stable", async (req, res) => {
 app.get("/api/changelog/experimental", async (req, res) => {
   try { const d = await buildChangelog("experimental"); res.set("Cache-Control", "public, max-age=120"); res.json({ latest: d.latest }); }
   catch (e) { res.status(e.notConfigured ? 503 : 502).json({ error: "unavailable" }); }
+});
+
+// ---------- "Request experimental": access requests + admin approve/deny ----------
+// People ask for access with a display name, GitHub username, platform and a
+// note on what they'd use/test. Approving sends a real GitHub invite to the
+// private repo (needs the token's Administration: read & write permission);
+// once they accept, they can see EXPERIMENTAL_KEY.txt.
+db.exec(`CREATE TABLE IF NOT EXISTS exp_requests (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, github TEXT NOT NULL, github_key TEXT NOT NULL,
+  avatar TEXT, verified INTEGER DEFAULT 0, platform TEXT, message TEXT, contact TEXT,
+  status TEXT NOT NULL DEFAULT 'pending', invite TEXT, note TEXT,
+  ts INTEGER NOT NULL, decided_ts INTEGER
+)`);
+db.exec("CREATE INDEX IF NOT EXISTS idx_exp_requests_gh ON exp_requests (github_key)");
+
+// General GitHub call (any method, optional JSON body). anon = never send the token.
+function ghApi(method, apiPath, body, anon) {
+  return new Promise((resolve, reject) => {
+    const token = process.env.GITHUB_EXPERIMENTAL_TOKEN;
+    const payload = body ? JSON.stringify(body) : null;
+    const headers = { "Accept": "application/vnd.github+json", "User-Agent": "oliverbar-pi", "X-GitHub-Api-Version": "2022-11-28" };
+    if (token && !anon) headers.Authorization = "Bearer " + token;
+    if (payload) { headers["Content-Type"] = "application/json"; headers["Content-Length"] = Buffer.byteLength(payload); }
+    const req = https.request({ host: "api.github.com", path: apiPath, method, headers }, (res) => {
+      let data = "";
+      res.on("data", (c) => { if (data.length < 1e6) data += c; });
+      res.on("end", () => resolve({ status: res.statusCode, body: data }));
+    });
+    req.on("error", reject);
+    req.setTimeout(15000, () => req.destroy(new Error("GitHub timed out")));
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+const GH_USER_RE = /^[a-zA-Z0-9](?:[a-zA-Z0-9]|-(?=[a-zA-Z0-9])){0,38}$/;
+const requestHits = new Map(); // ip -> [ts]
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, ts] of requestHits) if (!ts.some((t) => now - t < 3600000)) requestHits.delete(ip);
+}, 10 * 60 * 1000).unref();
+function publicRequest(r) {
+  return { id: r.id, name: r.name, github: r.github, status: r.status, note: r.note || "", ts: r.ts, decided: r.decided_ts || null };
+}
+
+app.post("/api/experimental/request", async (req, res) => {
+  const b = req.body || {};
+  const name = typeof b.name === "string" ? b.name.trim().slice(0, 40) : "";
+  const github = typeof b.github === "string" ? b.github.trim().replace(/^@/, "").replace(/^https?:\/\/github\.com\//i, "").replace(/\/.*$/, "") : "";
+  const platform = ["windows", "mac", "both"].indexOf(b.platform) !== -1 ? b.platform : "windows";
+  const message = typeof b.message === "string" ? b.message.trim().slice(0, 1000) : "";
+  const contact = typeof b.contact === "string" ? b.contact.trim().slice(0, 120) : "";
+  if (!name) return res.status(400).json({ error: "Add a display name." });
+  if (!GH_USER_RE.test(github)) return res.status(400).json({ error: "That doesn't look like a GitHub username." });
+  if (message.length < 10) return res.status(400).json({ error: "Tell us a little about why you'd like in (a sentence is plenty)." });
+
+  // Rate limit first (recorded synchronously, before any await).
+  const ip = clientIp(req), now = Date.now();
+  const hits = (requestHits.get(ip) || []).filter((t) => now - t < 3600000);
+  if (hits.length >= 3) return res.status(429).json({ error: "You've sent a few requests already — try again in an hour." });
+  const today = db.prepare("SELECT COUNT(*) AS c FROM exp_requests WHERE ts >= ?").get(now - 86400000).c;
+  if (today >= 150) return res.status(429).json({ error: "Lots of requests today — please try again tomorrow." });
+  hits.push(now); requestHits.set(ip, hits);
+
+  // Already asked with this GitHub account? Don't reveal that request's
+  // status/id to whoever typed the name — just say it's on file.
+  const existing = db.prepare("SELECT 1 FROM exp_requests WHERE github_key = ? AND status IN ('pending','approved') LIMIT 1").get(github.toLowerCase());
+  if (existing) return res.status(409).json({ error: "There's already a request on file for @" + github + ". If it's yours, the page you sent it from shows its status." });
+
+  // Check the GitHub account exists (anonymously; if GitHub is down, accept unverified).
+  let verified = 0, avatar = "", canonical = github;
+  try {
+    const u = await ghApi("GET", "/users/" + encodeURIComponent(github), null, true);
+    if (u.status === 404) return res.status(400).json({ error: "There's no GitHub account called @" + github + "." });
+    if (u.status === 200) { const j = JSON.parse(u.body); verified = 1; avatar = String(j.avatar_url || "").slice(0, 300); canonical = j.login || github; }
+  } catch (e) { /* unverified is fine */ }
+
+  const id = crypto.randomBytes(16).toString("hex");
+  db.prepare(`INSERT INTO exp_requests (id, name, github, github_key, avatar, verified, platform, message, contact, status, ts)
+              VALUES (?,?,?,?,?,?,?,?,?,'pending',?)`)
+    .run(id, name, canonical, canonical.toLowerCase(), avatar, verified, platform, message, contact, now);
+  res.json({ ok: true, request: publicRequest(db.prepare("SELECT * FROM exp_requests WHERE id = ?").get(id)) });
+});
+// Requester checks their own status; the 128-bit id is the only handle.
+app.get("/api/experimental/request/:id", (req, res) => {
+  const id = String(req.params.id || "");
+  if (!/^[0-9a-f]{32}$/.test(id)) return res.status(404).json({ error: "Not found" });
+  const r = db.prepare("SELECT * FROM exp_requests WHERE id = ?").get(id);
+  if (!r) return res.status(404).json({ error: "Not found" });
+  res.set("Cache-Control", "no-store");
+  res.json(publicRequest(r));
+});
+
+app.get("/api/ultra-admin/requests", (req, res) => {
+  if (!requireUltraAdmin(req, res)) return;
+  res.json(db.prepare("SELECT id, name, github, avatar, verified, platform, message, contact, status, invite, note, ts, decided_ts FROM exp_requests ORDER BY (status = 'pending') DESC, ts DESC LIMIT 500").all());
+});
+app.post("/api/ultra-admin/requests/decide", async (req, res) => {
+  if (!requireUltraAdmin(req, res)) return;
+  const b = req.body || {};
+  const r = db.prepare("SELECT * FROM exp_requests WHERE id = ?").get(String(b.id || ""));
+  if (!r) return res.status(404).json({ error: "Not found" });
+  const note = typeof b.note === "string" ? b.note.trim().slice(0, 300) : "";
+  if (b.decision === "deny") {
+    db.prepare("UPDATE exp_requests SET status='denied', note=?, decided_ts=? WHERE id=?").run(note, Date.now(), r.id);
+    return res.json({ ok: true, status: "denied" });
+  }
+  if (b.decision !== "approve") return res.status(400).json({ error: "bad decision" });
+  if (!GH_USER_RE.test(r.github)) return res.status(400).json({ error: "bad username on file" });
+  // Invite them to the private repo, read-only.
+  let invite = "failed", detail = "";
+  try {
+    if (!process.env.GITHUB_EXPERIMENTAL_TOKEN) throw new Error("No GitHub token on the Pi");
+    const g = await ghApi("PUT", `/repos/${EXP_REPO}/collaborators/${encodeURIComponent(r.github)}`, { permission: "pull" });
+    if (g.status === 201) invite = "sent";
+    else if (g.status === 204) invite = "already";
+    else {
+      let ghMsg = ""; try { const j = JSON.parse(g.body); ghMsg = (j.errors && j.errors[0] && j.errors[0].message) || j.message || ""; } catch (x) {}
+      detail = g.status === 403 ? "The Pi's token can't invite people yet (it needs Administration: read & write)."
+        : ("GitHub said " + g.status + (ghMsg ? ": " + ghMsg : ""));
+    }
+  } catch (e) { detail = e.message; }
+  db.prepare("UPDATE exp_requests SET status='approved', invite=?, note=?, decided_ts=? WHERE id=?").run(invite, note, Date.now(), r.id);
+  res.json({ ok: true, status: "approved", invite, detail });
+});
+app.post("/api/ultra-admin/requests/delete", (req, res) => {
+  if (!requireUltraAdmin(req, res)) return;
+  db.prepare("DELETE FROM exp_requests WHERE id = ?").run(String((req.body && req.body.id) || ""));
+  res.json({ ok: true });
 });
 
 // Browser downloads need a plain GET link, so the ticket rides in the URL.
