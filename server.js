@@ -1148,6 +1148,17 @@ setInterval(() => {
 }, 5 * 60 * 1000).unref();
 
 let globalKeyFails = []; // timestamps across all IPs — backstop if someone rotates addresses
+// Devices that have entered the right key before. During a flood that trips the
+// global cap, these keep working, so an attacker can't lock real testers out.
+// (Device ids are random per-browser UUIDs, so they can't be guessed.)
+const verifiedDevices = new Map(); // device -> last success ts
+function rememberDevice(device) {
+  verifiedDevices.set(device, Date.now());
+  if (verifiedDevices.size > 20000) { // keep memory bounded: drop the oldest half
+    const sorted = [...verifiedDevices.entries()].sort((a, b) => a[1] - b[1]);
+    sorted.slice(0, 10000).forEach(([d]) => verifiedDevices.delete(d));
+  }
+}
 app.post("/api/experimental/verify", async (req, res) => {
   const ip = clientIp(req), now = Date.now();
   const key = typeof (req.body && req.body.key) === "string" ? req.body.key.trim() : "";
@@ -1157,7 +1168,8 @@ app.post("/api/experimental/verify", async (req, res) => {
   // all see it. It's only removed again if the key turns out to be correct.
   const fails = (keyFails.get(ip) || []).filter((t) => now - t < FEEDBACK_WINDOW_MS);
   globalKeyFails = globalKeyFails.filter((t) => now - t < FEEDBACK_WINDOW_MS);
-  if (fails.length >= 10 || globalKeyFails.length >= 300) {
+  const globalTripped = globalKeyFails.length >= 300 && !verifiedDevices.has(device);
+  if (fails.length >= 10 || globalTripped) {
     keyFails.set(ip, fails);
     return res.status(429).json({ error: "Too many wrong keys — wait a few minutes and try again." });
   }
@@ -1173,6 +1185,7 @@ app.post("/api/experimental/verify", async (req, res) => {
       return res.status(401).json({ error: "That key isn't right." });
     }
     forgive();
+    rememberDevice(device);
     const rel = await experimentalRelease();
     res.json({ ok: true, ticket: signTicket(device), release: {
       name: rel.name, tag: rel.tag, published: rel.published,
