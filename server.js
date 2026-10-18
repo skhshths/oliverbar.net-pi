@@ -1313,6 +1313,105 @@ app.get("/api/changelog/experimental", async (req, res) => {
   catch (e) { res.status(e.notConfigured ? 503 : 502).json({ error: "unavailable" }); }
 });
 
+// ---------- "Where did you hear about us?" (asked after a stable download) ----------
+// Options are editable from the admin panel. Each option keeps a stable id, so
+// renaming one keeps its votes; removed options keep their history (shown as
+// "retired" in the admin results). One answer per device.
+db.exec(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+db.exec(`CREATE TABLE IF NOT EXISTS heard_responses (
+  device TEXT PRIMARY KEY, option_id TEXT NOT NULL, other TEXT, platform TEXT, ts INTEGER NOT NULL
+)`);
+const HEARD_DEFAULT = {
+  allowOther: true,
+  options: [
+    { id: "friend", label: "A friend or coworker" },
+    { id: "search", label: "Search (Google, Bing…)" },
+    { id: "youtube", label: "YouTube" },
+    { id: "social", label: "TikTok / Instagram / X" },
+    { id: "reddit", label: "Reddit" },
+    { id: "github", label: "GitHub" },
+  ],
+  retired: {}, // id -> last label, so old votes still have a name
+};
+function heardConfig() {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'heard'").get();
+  if (!row) return JSON.parse(JSON.stringify(HEARD_DEFAULT));
+  try { const c = JSON.parse(row.value); c.retired = c.retired || {}; return c; }
+  catch (e) { return JSON.parse(JSON.stringify(HEARD_DEFAULT)); }
+}
+const heardHits = new Map();
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, ts] of heardHits) if (!ts.some((t) => now - t < 3600000)) heardHits.delete(ip);
+}, 10 * 60 * 1000).unref();
+
+app.get("/api/heard/options", (req, res) => {
+  const c = heardConfig();
+  res.set("Cache-Control", "no-store");
+  res.json({ options: c.options.map((o) => ({ id: o.id, label: o.label })), allowOther: !!c.allowOther });
+});
+app.post("/api/heard", (req, res) => {
+  const b = req.body || {};
+  const device = typeof b.device === "string" ? b.device : "";
+  if (!/^[a-zA-Z0-9-]{16,64}$/.test(device)) return res.status(400).json({ error: "bad device" });
+  const c = heardConfig();
+  const option = String(b.option || "");
+  const isOther = option === "other";
+  if (isOther ? !c.allowOther : !c.options.some((o) => o.id === option)) return res.status(400).json({ error: "Pick one of the options." });
+  const other = isOther && typeof b.other === "string" ? b.other.trim().slice(0, 120) : "";
+  if (isOther && other.length < 2) return res.status(400).json({ error: "Tell us where (a word or two is fine)." });
+  const platform = ["windows", "mac"].indexOf(b.platform) !== -1 ? b.platform : "other";
+  const ip = clientIp(req), now = Date.now();
+  const hits = (heardHits.get(ip) || []).filter((t) => now - t < 3600000);
+  if (hits.length >= 20) return res.status(429).json({ error: "Too many answers — try again later." });
+  hits.push(now); heardHits.set(ip, hits);
+  const info = db.prepare("INSERT OR IGNORE INTO heard_responses (device, option_id, other, platform, ts) VALUES (?,?,?,?,?)")
+    .run(device, option, other || null, platform, now);
+  res.json({ ok: true, counted: info.changes === 1 });
+});
+
+app.get("/api/ultra-admin/heard", (req, res) => {
+  if (!requireUltraAdmin(req, res)) return;
+  const c = heardConfig();
+  const counts = {};
+  db.prepare("SELECT option_id, COUNT(*) AS n FROM heard_responses GROUP BY option_id").all().forEach((r) => { counts[r.option_id] = r.n; });
+  const total = Object.keys(counts).reduce((t, k) => t + counts[k], 0);
+  const results = c.options.map((o) => ({ id: o.id, label: o.label, count: counts[o.id] || 0 }));
+  if (c.allowOther || counts.other) results.push({ id: "other", label: "Other", count: counts.other || 0, other: true });
+  Object.keys(counts).forEach((id) => {
+    if (id !== "other" && !c.options.some((o) => o.id === id)) results.push({ id, label: c.retired[id] || id, count: counts[id], retired: true });
+  });
+  const others = db.prepare("SELECT other, ts FROM heard_responses WHERE option_id = 'other' AND other IS NOT NULL ORDER BY ts DESC LIMIT 50").all();
+  res.json({ config: { options: c.options, allowOther: !!c.allowOther }, results, total, others });
+});
+app.post("/api/ultra-admin/heard/config", (req, res) => {
+  if (!requireUltraAdmin(req, res)) return;
+  const b = req.body || {};
+  const prev = heardConfig();
+  const incoming = Array.isArray(b.options) ? b.options.slice(0, 20) : null;
+  if (!incoming) return res.status(400).json({ error: "options required" });
+  const used = new Set(), options = [];
+  incoming.forEach((o) => {
+    const label = typeof (o && o.label) === "string" ? o.label.trim().slice(0, 60) : "";
+    if (!label) return;
+    let id = typeof o.id === "string" && /^[a-z0-9_-]{1,32}$/.test(o.id) && o.id !== "other" ? o.id : "";
+    if (!id || used.has(id)) { // new option: slug from the label, made unique
+      const base = label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 24) || "option";
+      id = base; let n = 2;
+      while (used.has(id) || id === "other" || prev.retired[id]) id = base + "-" + n++;
+    }
+    used.add(id); options.push({ id, label });
+  });
+  if (!options.length) return res.status(400).json({ error: "Keep at least one option." });
+  const retired = Object.assign({}, prev.retired);
+  prev.options.forEach((o) => { if (!used.has(o.id)) retired[o.id] = o.label; });
+  options.forEach((o) => { delete retired[o.id]; });
+  const next = { options, allowOther: !!b.allowOther, retired };
+  db.prepare("INSERT INTO settings (key, value) VALUES ('heard', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+    .run(JSON.stringify(next));
+  res.json({ ok: true, config: { options: next.options, allowOther: next.allowOther } });
+});
+
 // ---------- "Request experimental": access requests + admin approve/deny ----------
 // People ask for access with a display name, GitHub username, platform and a
 // note on what they'd use/test. Approving sends a real GitHub invite to the
