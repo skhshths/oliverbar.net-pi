@@ -1329,7 +1329,10 @@ const HEARD_DEFAULT = {
     { id: "youtube", label: "YouTube" },
     { id: "social", label: "TikTok / Instagram / X" },
     { id: "reddit", label: "Reddit" },
+    { id: "discord", label: "Discord" },
+    { id: "hackernews", label: "Hacker News" },
     { id: "github", label: "GitHub" },
+    { id: "article", label: "A blog, article or newsletter" },
   ],
   retired: {}, // id -> last label, so old votes still have a name
 };
@@ -1382,7 +1385,8 @@ app.get("/api/ultra-admin/heard", (req, res) => {
     if (id !== "other" && !c.options.some((o) => o.id === id)) results.push({ id, label: c.retired[id] || id, count: counts[id], retired: true });
   });
   const others = db.prepare("SELECT other, ts FROM heard_responses WHERE option_id = 'other' AND other IS NOT NULL ORDER BY ts DESC LIMIT 50").all();
-  res.json({ config: { options: c.options, allowOther: !!c.allowOther }, results, total, others });
+  res.json({ config: { options: c.options, allowOther: !!c.allowOther }, results, total, others,
+    defaults: { options: HEARD_DEFAULT.options, allowOther: HEARD_DEFAULT.allowOther } });
 });
 app.post("/api/ultra-admin/heard/config", (req, res) => {
   if (!requireUltraAdmin(req, res)) return;
