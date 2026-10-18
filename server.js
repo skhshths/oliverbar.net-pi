@@ -965,9 +965,20 @@ db.exec(`CREATE TABLE IF NOT EXISTS feedback (
 db.exec("CREATE INDEX IF NOT EXISTS idx_downloads_ts ON downloads (ts)");
 
 const feedbackHits = new Map(); // ip -> [timestamps], simple spam brake
+const FEEDBACK_WINDOW_MS = 10 * 60 * 1000;
+const FEEDBACK_DAILY_CAP = 300; // global ceiling so a flood can't fill the disk
+// This server only listens on 127.0.0.1 behind the Cloudflare tunnel, so
+// CF-Connecting-IP is written by Cloudflare and can't be forged by a client.
+// (X-Forwarded-For is deliberately ignored — it's client-controlled.)
 function clientIp(req) {
-  return (req.get("CF-Connecting-IP") || req.get("X-Forwarded-For") || req.ip || "").split(",")[0].trim();
+  return String(req.get("CF-Connecting-IP") || "unknown").trim().slice(0, 64);
 }
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, ts] of feedbackHits) {
+    if (!ts.some((t) => now - t < FEEDBACK_WINDOW_MS)) feedbackHits.delete(ip);
+  }
+}, 5 * 60 * 1000).unref();
 app.post("/api/feedback", (req, res) => {
   const b = req.body || {};
   const message = typeof b.message === "string" ? b.message.trim().slice(0, 2000) : "";
@@ -976,8 +987,10 @@ app.post("/api/feedback", (req, res) => {
   const contact = typeof b.contact === "string" ? b.contact.trim().slice(0, 120) : "";
   const platform = ["windows", "mac", "other"].indexOf(b.platform) !== -1 ? b.platform : "other";
   const ip = clientIp(req), now = Date.now();
-  const recent = (feedbackHits.get(ip) || []).filter((t) => now - t < 10 * 60 * 1000);
+  const recent = (feedbackHits.get(ip) || []).filter((t) => now - t < FEEDBACK_WINDOW_MS);
   if (recent.length >= 5) return res.status(429).json({ error: "That's a lot of feedback — try again in a few minutes." });
+  const today = db.prepare("SELECT COUNT(*) AS c FROM feedback WHERE ts >= ?").get(now - 86400000).c;
+  if (today >= FEEDBACK_DAILY_CAP) return res.status(429).json({ error: "Feedback is busy right now — please try again tomorrow." });
   recent.push(now); feedbackHits.set(ip, recent);
   db.prepare("INSERT INTO feedback (id, kind, message, contact, platform, ua, ts) VALUES (?,?,?,?,?,?,?)")
     .run(randomHex(8), kind, message, contact, platform, String(req.get("User-Agent") || "").slice(0, 200), now);
