@@ -1088,7 +1088,7 @@ function ghRequest(apiPath, accept, publicOk) {
     if (!token && !publicOk) return reject(Object.assign(new Error("not configured"), { notConfigured: true }));
     const headers = { "Accept": accept || "application/vnd.github+json",
       "User-Agent": "oliverbar-pi", "X-GitHub-Api-Version": "2022-11-28" };
-    if (token) headers.Authorization = "Bearer " + token;
+    if (token && publicOk !== "anon") headers.Authorization = "Bearer " + token;
     const req = https.request({
       host: "api.github.com", path: apiPath, method: "GET",
       headers: headers,
@@ -1246,12 +1246,33 @@ function cleanItems(messages, channel) {
   });
   return out.slice(0, 7);
 }
-async function buildChangelog(channel) {
-  const c = changelogCache[channel];
-  if (c && Date.now() - c.at < CHANGELOG_TTL_MS) return c.data;
+const CHANGELOG_FAIL_TTL_MS = 2 * 60 * 1000;
+// One shared fetch per channel: concurrent misses await the same promise,
+// and failures are remembered briefly so errors can't fan out into a
+// GitHub call per request.
+function buildChangelog(channel) {
+  const c = changelogCache[channel] || (changelogCache[channel] = {});
+  const now = Date.now();
+  if (c.data && now - c.at < CHANGELOG_TTL_MS) return Promise.resolve(c.data);
+  if (c.inflight) return c.inflight;
+  if (c.failAt && now - c.failAt < CHANGELOG_FAIL_TTL_MS) {
+    return c.data ? Promise.resolve(c.data) : Promise.reject(c.failErr);
+  }
+  c.inflight = fetchChangelog(channel).then((data) => {
+    c.data = data; c.at = Date.now(); c.failAt = 0; return data;
+  }, (e) => {
+    c.failAt = Date.now(); c.failErr = e;
+    if (c.data) return c.data; // serve stale rather than nothing
+    throw e;
+  }).finally(() => { c.inflight = null; });
+  return c.inflight;
+}
+async function fetchChangelog(channel) {
   const repo = channel === "stable" ? "skhshths/ULTRA" : EXP_REPO;
-  const publicOk = channel === "stable";
-  try {
+  // Public repo: always anonymous, so site traffic never spends the private
+  // repo token's quota.
+  const publicOk = channel === "stable" ? "anon" : false;
+  {
     const r = await ghRequest(`/repos/${repo}/releases?per_page=10`, null, publicOk);
     if (r.status !== 200) throw new Error("releases " + r.status);
     const rels = JSON.parse(r.body).filter((x) => !x.draft);
@@ -1270,12 +1291,7 @@ async function buildChangelog(channel) {
       entries.push({ name: rels[i].name || head, tag: head, published: rels[i].published_at,
         url: channel === "stable" ? rels[i].html_url : undefined, changes: cleanItems(msgs, channel) });
     }
-    const data = { latest: entries[0] ? { name: entries[0].name, tag: entries[0].tag, published: entries[0].published } : null, releases: entries };
-    changelogCache[channel] = { at: Date.now(), data };
-    return data;
-  } catch (e) {
-    if (c) return c.data; // serve stale rather than nothing
-    throw e;
+    return { latest: entries[0] ? { name: entries[0].name, tag: entries[0].tag, published: entries[0].published } : null, releases: entries };
   }
 }
 app.get("/api/changelog/stable", async (req, res) => {
